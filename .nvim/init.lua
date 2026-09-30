@@ -42,6 +42,10 @@ vim.cmd(':set expandtab')
 vim.cmd(':set textwidth=120')
 vim.cmd(':set colorcolumn=+1')
 
+vim.keymap.set('n', '<leader>f', function()
+    vim.lsp.buf.format()
+end, {desc = 'formats the current buffer'})
+
 vim.cmd(':below 15split term://bash')
 vim.cmd(':tnoremap <Esc><Esc> <C-\\><C-n>')
 vim.cmd(':tnoremap <A-h> <C-\\><C-N><C-w>h') 
