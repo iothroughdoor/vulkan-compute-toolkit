@@ -39,6 +39,8 @@ vim.cmd(':set number')
 vim.cmd(':set tabstop=4')
 vim.cmd(':set shiftwidth=4')
 vim.cmd(':set expandtab')
+vim.cmd(':set textwidth=120')
+vim.cmd(':set colorcolumn=+1')
 
 vim.cmd(':below 15split term://bash')
 vim.cmd(':tnoremap <Esc><Esc> <C-\\><C-n>')
