@@ -1,0 +1,11 @@
+[package]
+name = "vulkan-computing-toolkit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ash = {version = "*"} # , default-features = false, features = ["linked", "debug"]}
+
+[[test]]
+name = "smoke_tests"
+path = "tests/smoke_tests.rs"
