@@ -85,14 +85,11 @@ pub enum KernelError {
 pub struct Kernel<'a> {
     device: Device,
     res_mgr: &'a KernelResourceManager,
+
     pipeline: vk::Pipeline,
     descriptor_set: vk::DescriptorSet,
     buffers: Vec<vk::Buffer>,
     memory: Vec<vk::DeviceMemory>,
-}
-
-pub struct KernelResourceDescription {
-    binding_nr: u32,
 }
 
 impl<'a> Kernel<'a> {
@@ -121,15 +118,15 @@ impl<'a> Kernel<'a> {
                 .map_err(|_| KernelError::ShaderModuleCreation)
         }?;
         let descriptor_set_layout =
-            Self::create_descriptor_set_layout(&cctx.device, binding_nrs, descriptor_types)?;
+            create_descriptor_set_layout(&cctx.device, binding_nrs, descriptor_types)?;
         let pipeline =
-            Self::create_pipeline(&cctx.device, &[descriptor_set_layout], shader_module)?;
+            create_pipeline(&cctx.device, &[descriptor_set_layout], shader_module)?;
 
         let mut buffers_with_memory: (Vec<vk::Buffer>, Vec<vk::DeviceMemory>) = (vec![], vec![]);
         for i in 0..binding_nrs.len() {
             match descriptor_types[i] {
                 vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER => {
-                    let (buffer, buffer_memory) = KernelResourceManager::create_buffer_with_memory(
+                    let (buffer, buffer_memory) = create_buffer_with_memory(
                         cctx,
                         buffer_usage_flags[i].ok_or(KernelError::InvalidResourceSpec)?,
                         memory_prop_flags[i].ok_or(KernelError::InvalidResourceSpec)?,
@@ -149,7 +146,7 @@ impl<'a> Kernel<'a> {
             .allocate_descriptor_set(descriptor_set_layout)
             .map_err(|e| KernelError::KernelResourceManager(e))?;
 
-        Self::bind_descriptor_set(
+        bind_descriptor_set_to_buffer(
             &cctx.device,
             descriptor_set,
             &binding_nrs,
@@ -166,98 +163,8 @@ impl<'a> Kernel<'a> {
             memory: buffers_with_memory.1,
         })
     }
-
-    fn bind_descriptor_set(
-        device: &Device,
-        descriptor_set: vk::DescriptorSet,
-        binding_nrs: &[u32],
-        descriptor_types: &[vk::DescriptorType],
-        buffers: &[vk::Buffer],
-    ) -> Result<(), KernelError> {
-        let mut writes: Vec<vk::WriteDescriptorSet> = vec![];
-        let mut buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = vec![];
-        for i in 0..binding_nrs.len() {
-            let buffer_info = vk::DescriptorBufferInfo::default()
-                .buffer(buffers[i])
-                .offset(0)
-                .range(vk::WHOLE_SIZE);
-            buffer_infos.push([buffer_info]);
-        }
-        for i in 0..binding_nrs.len() {
-            let write_descriptor_set = vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(binding_nrs[i])
-                .dst_array_element(0)
-                .descriptor_type(descriptor_types[i])
-                .descriptor_count(1)
-                .buffer_info(&buffer_infos[i]);
-            writes.push(write_descriptor_set);
-        }
-        unsafe {
-            device.update_descriptor_sets(&writes, &[]);
-        }
-        Ok(())
-    }
-
-    fn create_pipeline(
-        device: &Device,
-        descriptor_set_layouts: &[vk::DescriptorSetLayout],
-        shader_module: vk::ShaderModule,
-    ) -> Result<vk::Pipeline, KernelError> {
-        let pipeline_layout_create_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(descriptor_set_layouts);
-        let pipeline_layout = unsafe {
-            device
-                .create_pipeline_layout(&pipeline_layout_create_info, None)
-                .map_err(|_| KernelError::PipelineLayoutCreation)?
-        };
-
-        let shader_stage_create_info = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader_module)
-            .name(c"main");
-        let pipeline_create_infos = [vk::ComputePipelineCreateInfo::default()
-            .layout(pipeline_layout)
-            .stage(shader_stage_create_info)];
-        let pipelines = unsafe {
-            device
-                .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_create_infos, None)
-                .map_err(|_| KernelError::PipelineCreation)?
-        };
-
-        unsafe {
-            device.destroy_shader_module(shader_module, None);
-            device.destroy_pipeline_layout(pipeline_layout, None);
-        }
-
-        Ok(pipelines[0])
-    }
-
-    fn create_descriptor_set_layout(
-        device: &Device,
-        bindings: &[u32],
-        descriptor_types: &[vk::DescriptorType],
-    ) -> Result<vk::DescriptorSetLayout, KernelError> {
-        let descriptor_set_layout_bindings = bindings
-            .iter()
-            .zip(descriptor_types.iter())
-            .map(|(b, d)| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(*b)
-                    .descriptor_type(*d)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            })
-            .collect::<Vec<vk::DescriptorSetLayoutBinding>>();
-        let descriptor_set_layout_create_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_set_layout_bindings);
-        unsafe {
-            device
-                .create_descriptor_set_layout(&descriptor_set_layout_create_info, None)
-                .map_err(|_| KernelError::DescriptorSetLayoutCreation)
-        }
-    }
 }
+
 
 impl<'a> Drop for Kernel<'a> {
     fn drop(&mut self) {
@@ -321,66 +228,6 @@ impl KernelResourceManager {
         })
     }
 
-    fn create_buffer_with_memory(
-        vk_ctx: &ComputeContext,
-        buffer_usages: vk::BufferUsageFlags,
-        requested_memory_properties: vk::MemoryPropertyFlags,
-        size: u64,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), KernelResourceManagerError> {
-        let buffer_create_info = vk::BufferCreateInfo::default()
-            .usage(buffer_usages)
-            .size(size)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe {
-            vk_ctx
-                .device
-                .create_buffer(&buffer_create_info, None)
-                .map_err(|_| KernelResourceManagerError::BufferCreation)?
-        };
-
-        let buffer_memory_requirements =
-            unsafe { vk_ctx.device.get_buffer_memory_requirements(buffer) };
-        let elligible_memory_type_index = Self::find_memory_type_index(
-            buffer_memory_requirements.memory_type_bits,
-            &requested_memory_properties,
-            &vk_ctx.memory_properties,
-        )
-        .ok_or(KernelResourceManagerError::BufferMemoryIncompatibility)?;
-
-        let memory_allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(buffer_memory_requirements.size)
-            .memory_type_index(elligible_memory_type_index);
-        let device_memory = unsafe {
-            vk_ctx
-                .device
-                .allocate_memory(&memory_allocate_info, None)
-                .map_err(|_| KernelResourceManagerError::DeviceMemoryAllocation)?
-        };
-        unsafe {
-            vk_ctx
-                .device
-                .bind_buffer_memory(buffer, device_memory, 0)
-                .map_err(|_| KernelResourceManagerError::BindingMemoryToBuffer)?
-        };
-        Ok((buffer, device_memory))
-    }
-
-    fn find_memory_type_index(
-        buffer_required_memory_type: u32,
-        requested_memory_properties: &vk::MemoryPropertyFlags,
-        device_memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    ) -> Option<u32> {
-        for i in 0..device_memory_properties.memory_type_count {
-            if buffer_required_memory_type & (1 << i) != 0
-                && device_memory_properties.memory_types[i as usize]
-                    .property_flags
-                    .intersects(*requested_memory_properties)
-            {
-                return Some(i);
-            }
-        }
-        None
-    }
 
     fn allocate_descriptor_set(
         &self,
@@ -487,6 +334,160 @@ fn create_logical_device(
             .map_err(|_| ComputeContextError::DeviceCreation)
     }
 }
+
+
+fn create_buffer_with_memory(
+    vk_ctx: &ComputeContext,
+    buffer_usages: vk::BufferUsageFlags,
+    requested_memory_properties: vk::MemoryPropertyFlags,
+    size: u64,
+) -> Result<(vk::Buffer, vk::DeviceMemory), KernelResourceManagerError> {
+    let buffer_create_info = vk::BufferCreateInfo::default()
+        .usage(buffer_usages)
+        .size(size)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe {
+        vk_ctx
+            .device
+            .create_buffer(&buffer_create_info, None)
+            .map_err(|_| KernelResourceManagerError::BufferCreation)?
+    };
+
+    let buffer_memory_requirements =
+        unsafe { vk_ctx.device.get_buffer_memory_requirements(buffer) };
+    let elligible_memory_type_index = find_memory_type_index(
+        buffer_memory_requirements.memory_type_bits,
+        &requested_memory_properties,
+        &vk_ctx.memory_properties,
+    )
+    .ok_or(KernelResourceManagerError::BufferMemoryIncompatibility)?;
+
+    let memory_allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(buffer_memory_requirements.size)
+        .memory_type_index(elligible_memory_type_index);
+    let device_memory = unsafe {
+        vk_ctx
+            .device
+            .allocate_memory(&memory_allocate_info, None)
+            .map_err(|_| KernelResourceManagerError::DeviceMemoryAllocation)?
+    };
+    unsafe {
+        vk_ctx
+            .device
+            .bind_buffer_memory(buffer, device_memory, 0)
+            .map_err(|_| KernelResourceManagerError::BindingMemoryToBuffer)?
+    };
+    Ok((buffer, device_memory))
+}
+
+fn find_memory_type_index(
+    buffer_required_memory_type: u32,
+    requested_memory_properties: &vk::MemoryPropertyFlags,
+    device_memory_properties: &vk::PhysicalDeviceMemoryProperties,
+) -> Option<u32> {
+    for i in 0..device_memory_properties.memory_type_count {
+        if buffer_required_memory_type & (1 << i) != 0
+            && device_memory_properties.memory_types[i as usize]
+                .property_flags
+                .intersects(*requested_memory_properties)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn bind_descriptor_set_to_buffer(
+    device: &Device,
+    descriptor_set: vk::DescriptorSet,
+    binding_nrs: &[u32],
+    descriptor_types: &[vk::DescriptorType],
+    buffers: &[vk::Buffer],
+) -> Result<(), KernelError> {
+    let mut writes: Vec<vk::WriteDescriptorSet> = vec![];
+    let mut buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = vec![];
+    for i in 0..binding_nrs.len() {
+        let buffer_info = vk::DescriptorBufferInfo::default()
+            .buffer(buffers[i])
+            .offset(0)
+            .range(vk::WHOLE_SIZE);
+        buffer_infos.push([buffer_info]);
+    }
+    for i in 0..binding_nrs.len() {
+        let write_descriptor_set = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(binding_nrs[i])
+            .dst_array_element(0)
+            .descriptor_type(descriptor_types[i])
+            .descriptor_count(1)
+            .buffer_info(&buffer_infos[i]);
+        writes.push(write_descriptor_set);
+    }
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
+    }
+    Ok(())
+}
+
+fn create_pipeline(
+    device: &Device,
+    descriptor_set_layouts: &[vk::DescriptorSetLayout],
+    shader_module: vk::ShaderModule,
+) -> Result<vk::Pipeline, KernelError> {
+    let pipeline_layout_create_info =
+        vk::PipelineLayoutCreateInfo::default().set_layouts(descriptor_set_layouts);
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(&pipeline_layout_create_info, None)
+            .map_err(|_| KernelError::PipelineLayoutCreation)?
+    };
+
+    let shader_stage_create_info = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(shader_module)
+        .name(c"main");
+    let pipeline_create_infos = [vk::ComputePipelineCreateInfo::default()
+        .layout(pipeline_layout)
+        .stage(shader_stage_create_info)];
+    let pipelines = unsafe {
+        device
+            .create_compute_pipelines(vk::PipelineCache::null(), &pipeline_create_infos, None)
+            .map_err(|_| KernelError::PipelineCreation)?
+    };
+
+    unsafe {
+        device.destroy_shader_module(shader_module, None);
+        device.destroy_pipeline_layout(pipeline_layout, None);
+    }
+
+    Ok(pipelines[0])
+}
+
+fn create_descriptor_set_layout(
+    device: &Device,
+    bindings: &[u32],
+    descriptor_types: &[vk::DescriptorType],
+) -> Result<vk::DescriptorSetLayout, KernelError> {
+    let descriptor_set_layout_bindings = bindings
+        .iter()
+        .zip(descriptor_types.iter())
+        .map(|(b, d)| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(*b)
+                .descriptor_type(*d)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        })
+        .collect::<Vec<vk::DescriptorSetLayoutBinding>>();
+    let descriptor_set_layout_create_info =
+        vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_set_layout_bindings);
+    unsafe {
+        device
+            .create_descriptor_set_layout(&descriptor_set_layout_create_info, None)
+            .map_err(|_| KernelError::DescriptorSetLayoutCreation)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
