@@ -1,4 +1,4 @@
-use ash::{Device, Entry, Instance, vk};
+use ash::{Device, Entry, Instance, prelude::VkResult, vk};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use thiserror::Error;
@@ -35,10 +35,6 @@ pub struct ComputeContext {
     device: Device,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     compute_queue_family_index: u32,
-    //command_pool_permanent: vk::CommandPool,
-    //command_pool_short_lived: vk::CommandPool,
-
-    //compute_command_buffer: vk::CommandBuffer,
 }
 
 impl ComputeContext {
@@ -119,8 +115,7 @@ impl<'a> Kernel<'a> {
         }?;
         let descriptor_set_layout =
             create_descriptor_set_layout(&cctx.device, binding_nrs, descriptor_types)?;
-        let pipeline =
-            create_pipeline(&cctx.device, &[descriptor_set_layout], shader_module)?;
+        let pipeline = create_pipeline(&cctx.device, &[descriptor_set_layout], shader_module)?;
 
         let mut buffers_with_memory: (Vec<vk::Buffer>, Vec<vk::DeviceMemory>) = (vec![], vec![]);
         for i in 0..binding_nrs.len() {
@@ -154,6 +149,11 @@ impl<'a> Kernel<'a> {
             &buffers_with_memory.0,
         )?;
 
+        unsafe {
+            cctx.device
+                .destroy_descriptor_set_layout(descriptor_set_layout, None);
+        }
+
         Ok(Kernel {
             device: cctx.device.clone(),
             res_mgr: &res_mgr,
@@ -164,7 +164,6 @@ impl<'a> Kernel<'a> {
         })
     }
 }
-
 
 impl<'a> Drop for Kernel<'a> {
     fn drop(&mut self) {
@@ -228,7 +227,6 @@ impl KernelResourceManager {
         })
     }
 
-
     fn allocate_descriptor_set(
         &self,
         descriptor_set_layout: vk::DescriptorSetLayout,
@@ -259,6 +257,79 @@ impl Drop for KernelResourceManager {
                 .destroy_descriptor_pool(self.descriptor_pool, None);
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum DispatcherError {
+    #[error("Creation of the command pool failed")]
+    CommandPoolCreation,
+    #[error("Allocating the command buffers failed")]
+    CommandBufferAllocation,
+}
+
+pub struct Dispatcher {
+    device: Device,
+    command_pool_permanent: vk::CommandPool,
+    //command_pool_short_lived: vk::CommandPool,
+    submit_kernel_command_buffer: vk::CommandBuffer,
+    transfer_h2d_command_buffer: vk::CommandBuffer,
+    transfer_d2h_command_buffer: vk::CommandBuffer,
+}
+
+impl Dispatcher {
+    fn new(cctx: &ComputeContext) -> Result<Self, DispatcherError> {
+        let command_pool_permanent = create_command_pool(
+            &cctx.device,
+            cctx.compute_queue_family_index,
+            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+        )
+        .map_err(|_| DispatcherError::CommandPoolCreation)?;
+
+        let compute_command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool_permanent)
+            .command_buffer_count(3)
+            .level(vk::CommandBufferLevel::PRIMARY);
+        let command_buffers = unsafe {
+            cctx.device
+                .allocate_command_buffers(&compute_command_buffer_allocate_info)
+                .map_err(|_| DispatcherError::CommandBufferAllocation)?
+        };
+
+        Ok(Dispatcher {
+            device: cctx.device.clone(),
+            command_pool_permanent,
+            submit_kernel_command_buffer: command_buffers[0],
+            transfer_h2d_command_buffer: command_buffers[1],
+            transfer_d2h_command_buffer: command_buffers[2],
+        })
+    }
+}
+
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.free_command_buffers(
+                self.command_pool_permanent,
+                &[
+                    self.submit_kernel_command_buffer,
+                    self.transfer_h2d_command_buffer,
+                    self.transfer_d2h_command_buffer,
+                ],
+            );
+            self.device.destroy_command_pool(self.command_pool_permanent, None);
+        }
+    }
+}
+
+fn create_command_pool(
+    device: &Device,
+    queue_family_index: u32,
+    flags: vk::CommandPoolCreateFlags,
+) -> VkResult<vk::CommandPool> {
+    let command_pool_create_info = vk::CommandPoolCreateInfo::default()
+        .flags(flags)
+        .queue_family_index(queue_family_index);
+    unsafe { device.create_command_pool(&command_pool_create_info, None) }
 }
 
 fn create_vk_instance(app_name: &CStr, app_version: u32) -> Result<Instance, ComputeContextError> {
@@ -335,9 +406,8 @@ fn create_logical_device(
     }
 }
 
-
 fn create_buffer_with_memory(
-    vk_ctx: &ComputeContext,
+    cctx: &ComputeContext,
     buffer_usages: vk::BufferUsageFlags,
     requested_memory_properties: vk::MemoryPropertyFlags,
     size: u64,
@@ -347,18 +417,16 @@ fn create_buffer_with_memory(
         .size(size)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = unsafe {
-        vk_ctx
-            .device
+        cctx.device
             .create_buffer(&buffer_create_info, None)
             .map_err(|_| KernelResourceManagerError::BufferCreation)?
     };
 
-    let buffer_memory_requirements =
-        unsafe { vk_ctx.device.get_buffer_memory_requirements(buffer) };
+    let buffer_memory_requirements = unsafe { cctx.device.get_buffer_memory_requirements(buffer) };
     let elligible_memory_type_index = find_memory_type_index(
         buffer_memory_requirements.memory_type_bits,
         &requested_memory_properties,
-        &vk_ctx.memory_properties,
+        &cctx.memory_properties,
     )
     .ok_or(KernelResourceManagerError::BufferMemoryIncompatibility)?;
 
@@ -366,14 +434,12 @@ fn create_buffer_with_memory(
         .allocation_size(buffer_memory_requirements.size)
         .memory_type_index(elligible_memory_type_index);
     let device_memory = unsafe {
-        vk_ctx
-            .device
+        cctx.device
             .allocate_memory(&memory_allocate_info, None)
             .map_err(|_| KernelResourceManagerError::DeviceMemoryAllocation)?
     };
     unsafe {
-        vk_ctx
-            .device
+        cctx.device
             .bind_buffer_memory(buffer, device_memory, 0)
             .map_err(|_| KernelResourceManagerError::BindingMemoryToBuffer)?
     };
@@ -488,7 +554,6 @@ fn create_descriptor_set_layout(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,7 +564,7 @@ mod tests {
         let res_mgr =
             KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
         let shader_dummy = &[0u32];
-        let _kernel = Kernel::new(
+        if let Ok(_kernel) = Kernel::new(
             &cctx,
             &res_mgr,
             shader_dummy,
@@ -510,7 +575,8 @@ mod tests {
                 &[None],
                 &[None],
             ),
-        )
-        .expect("Kernel creation failed");
+        ) {
+            panic!("Why is the shader valid?");
+        }
     }
 }
