@@ -401,6 +401,8 @@ pub enum DispatcherError {
     WaitingOnFence,
     #[error("Resetting of fence failed")]
     ResettingFence,
+    #[error("Semaphore creation failed")]
+    SemaphoreCreation,
 }
 
 #[derive(Default, Clone)]
@@ -408,9 +410,7 @@ struct ComputeStream {
     max_submissions_in_flight: u32, //< number of command buffers per stream that can be in
     // use simultaneously
     compute_queue: vk::Queue,
-    exec_kernel_submission_slots: Vec<(vk::CommandBuffer, vk::Fence, vk::Semaphore)>,
-    transfer_h2d_submission_slots: Vec<(vk::CommandBuffer, vk::Fence, vk::Semaphore)>,
-    transfer_d2h_submission_slots: Vec<(vk::CommandBuffer, vk::Fence, vk::Semaphore)>,
+    submission_slots: Vec<(vk::CommandBuffer, vk::Fence, vk::Semaphore)>,
     next_submission_slot: usize,
 }
 
@@ -461,6 +461,7 @@ impl<'a> Dispatcher<'a> {
 
         let fence_create_info =
             vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let sem_create_info = vk::SemaphoreCreateInfo::default();
 
         for stream in compute_streams.iter_mut().rev() {
             stream.max_submissions_in_flight = Self::MAX_SUBMISSIONS_IN_FLIGHT;
@@ -468,26 +469,14 @@ impl<'a> Dispatcher<'a> {
                 .pop()
                 .ok_or(DispatcherError::StreamCntQueueCntMismatch)?;
             for _ in 0..Self::MAX_SUBMISSIONS_IN_FLIGHT {
-                stream.exec_kernel_submission_slots.push((
+                stream.submission_slots.push((
                     command_buffers
                         .pop()
                         .ok_or(DispatcherError::NotEnoughBuffers)?,
                     unsafe { cctx.device.create_fence(&fence_create_info, None) }
                         .map_err(|_| DispatcherError::FenceCreation)?,
-                ));
-                stream.transfer_h2d_submission_slots.push((
-                    command_buffers
-                        .pop()
-                        .ok_or(DispatcherError::NotEnoughBuffers)?,
-                    unsafe { cctx.device.create_fence(&fence_create_info, None) }
-                        .map_err(|_| DispatcherError::FenceCreation)?,
-                ));
-                stream.transfer_d2h_submission_slots.push((
-                    command_buffers
-                        .pop()
-                        .ok_or(DispatcherError::NotEnoughBuffers)?,
-                    unsafe { cctx.device.create_fence(&fence_create_info, None) }
-                        .map_err(|_| DispatcherError::FenceCreation)?,
+                    unsafe { cctx.device.create_semaphore(&sem_create_info, None) }
+                        .map_err(|_| DispatcherError::SemaphoreCreation)?,
                 ));
             }
         }
@@ -502,13 +491,17 @@ impl<'a> Dispatcher<'a> {
 
     fn create_stage(
         &self,
-        kernel: &Kernel,
+        args: &[DeviceVariable],
     ) -> Result<(vk::Buffer, vk::DeviceMemory), DispatcherError> {
-        let total_arg_size = kernel
-            .buffers
+        let total_arg_size = args
             .iter()
-            .map(|&buffer| unsafe { self.cctx.device.get_buffer_memory_requirements(buffer).size })
-            .sum::<u64>();
+            .map(|dev_var| unsafe {
+                self.cctx
+                    .device
+                    .get_buffer_memory_requirements(dev_var.buffer)
+                    .size
+            })
+            .sum();
 
         let buffer_create_info = vk::BufferCreateInfo::default()
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
@@ -560,16 +553,26 @@ impl<'a> Dispatcher<'a> {
         unsafe { self.cctx.device.destroy_buffer(stage.0, None) };
     }
 
-    fn submit_argument_upload(
-        &self,
-        kernel: &Kernel,
-        stage: (vk::Buffer, vk::DeviceMemory),
+    pub fn submit_upload(
+        &mut self,
+        dev_vars: &[DeviceVariable],
         arg_vals: &[Box<dyn DeviceTransferable>],
-        submission_slot: (vk::CommandBuffer, vk::Fence),
-        queue: vk::Queue,
+        stream_nr: usize,
     ) -> Result<(), DispatcherError> {
+        let queue = self.compute_streams[stream_nr].compute_queue;
+        let prev_submission_slot = self.get_current_submission_slot(stream_nr);
+        let submission_slot = self.acquire_next_submission_slot(stream_nr)?;
         let command_buffer = submission_slot.0;
         let fence = submission_slot.1;
+        let signal_semaphore = submission_slot.2;
+        let wait_semaphore =
+            match unsafe { self.cctx.device.get_fence_status(prev_submission_slot.1) } {
+                Ok(_) => Some(prev_submission_slot.2),
+                _ => None,
+            };
+
+        let stage = self.create_stage(dev_vars)?;
+
         let total_mem_size = unsafe {
             self.cctx
                 .device
@@ -597,13 +600,17 @@ impl<'a> Dispatcher<'a> {
         };
         let mut offset: usize = 0;
         let command_buffers = [command_buffer];
-        for (val, &buffer) in arg_vals.iter().zip(kernel.buffers.iter()) {
+        for (val, dev_var) in arg_vals.iter().zip(dev_vars.iter()) {
             // copy
             val.cpy_to(mapped_mem, offset);
-            let val_size: usize =
-                unsafe { self.cctx.device.get_buffer_memory_requirements(buffer).size }
-                    .try_into()
-                    .map_err(|_| DispatcherError::Casting)?;
+            let val_size: usize = unsafe {
+                self.cctx
+                    .device
+                    .get_buffer_memory_requirements(dev_var.buffer)
+                    .size
+            }
+            .try_into()
+            .map_err(|_| DispatcherError::Casting)?;
 
             // command record
             let copy_region = vk::BufferCopy::default()
@@ -611,60 +618,58 @@ impl<'a> Dispatcher<'a> {
                 .dst_offset(0)
                 .size(val_size.try_into().map_err(|_| DispatcherError::Casting)?);
             unsafe {
-                self.cctx
-                    .device
-                    .cmd_copy_buffer(command_buffer, stage.0, buffer, &[copy_region]);
+                self.cctx.device.cmd_copy_buffer(
+                    command_buffer,
+                    stage.0,
+                    dev_var.buffer,
+                    &[copy_region],
+                );
             }
             offset += val_size;
         }
         unsafe { self.cctx.device.end_command_buffer(command_buffer) }
             .map_err(|_| DispatcherError::EndingCommandBuffer)?;
-        let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        let wait_semaphores = wait_semaphore.map_or(vec![], |s| vec![s]);
+        let signal_semaphores = [signal_semaphore];
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(&command_buffers)
+            .wait_semaphores(&wait_semaphores)
+            .signal_semaphores(&signal_semaphores);
         unsafe { self.cctx.device.queue_submit(queue, &[submit_info], fence) }
             .map_err(|_| DispatcherError::ComputeQueueSubmission)?;
 
         Ok(())
     }
 
-    fn get_next_submission_slots(
+    fn get_current_submission_slot(
         &mut self,
         stream_nr: usize,
-    ) -> Result<[(vk::CommandBuffer, vk::Fence, vk::Semaphore); 3], DispatcherError> {
+    ) -> (vk::CommandBuffer, vk::Fence, vk::Semaphore) {
         let stream = &mut self.compute_streams[stream_nr];
-        let exec_kernel_submission_slot =
-            stream.exec_kernel_submission_slots[stream.next_submission_slot];
-        let transfer_h2d_submission_slot =
-            stream.transfer_h2d_submission_slots[stream.next_submission_slot];
-        let transfer_d2h_submission_slot =
-            stream.transfer_d2h_submission_slots[stream.next_submission_slot];
+        let cur_subm_slot_idx = (stream.next_submission_slot - 1
+            + Self::MAX_SUBMISSIONS_IN_FLIGHT as usize)
+            % (Self::MAX_SUBMISSIONS_IN_FLIGHT as usize);
+        stream.submission_slots[cur_subm_slot_idx]
+    }
+
+    fn acquire_next_submission_slot(
+        &mut self,
+        stream_nr: usize,
+    ) -> Result<(vk::CommandBuffer, vk::Fence, vk::Semaphore), DispatcherError> {
+        let stream = &mut self.compute_streams[stream_nr];
+        let submission_slot = stream.submission_slots[stream.next_submission_slot];
         unsafe {
-            self.cctx.device.wait_for_fences(
-                &[
-                    exec_kernel_submission_slot.1,
-                    transfer_h2d_submission_slot.1,
-                    transfer_d2h_submission_slot.1,
-                ],
-                true,
-                u64::MAX,
-            )
+            self.cctx
+                .device
+                .wait_for_fences(&[submission_slot.1], true, u64::MAX)
         }
         .map_err(|_| DispatcherError::WaitingOnFence)?;
-        unsafe {
-            self.cctx.device.reset_fences(&[
-                exec_kernel_submission_slot.1,
-                transfer_h2d_submission_slot.1,
-                transfer_d2h_submission_slot.1,
-            ])
-        }
-        .map_err(|_| DispatcherError::ResettingFence)?;
+        unsafe { self.cctx.device.reset_fences(&[submission_slot.1]) }
+            .map_err(|_| DispatcherError::ResettingFence)?;
         stream.next_submission_slot =
             (stream.next_submission_slot + 1) % (Self::MAX_SUBMISSIONS_IN_FLIGHT as usize);
 
-        Ok([
-            exec_kernel_submission_slot,
-            transfer_h2d_submission_slot,
-            transfer_d2h_submission_slot,
-        ])
+        Ok(submission_slot)
     }
 
     fn submit_launch(
@@ -677,7 +682,10 @@ impl<'a> Dispatcher<'a> {
         let command_buffer = subm_slot.0;
         let fence = subm_slot.1;
 
-        let buffers = args.iter().map(|dev_var| dev_var.buffer).collect::<Vec<vk::Buffer>>();
+        let buffers = args
+            .iter()
+            .map(|dev_var| dev_var.buffer)
+            .collect::<Vec<vk::Buffer>>();
 
         bind_descriptor_set_to_buffer(
             &self.cctx.device,
@@ -769,7 +777,7 @@ impl<'a> Drop for Dispatcher<'a> {
     fn drop(&mut self) {
         for stream in self.compute_streams {
             for i in 0..stream.max_submissions_in_flight {
-                let exec_kernel_submission = stream.exec_kernel_submission_slots[i as usize];
+                let exec_kernel_submission = stream.submission_slots[i as usize];
                 let transfer_h2d_submission = stream.transfer_h2d_submission_slots[i as usize];
                 let transfer_d2h_submission = stream.transfer_h2d_submission_slots[i as usize];
                 unsafe {
