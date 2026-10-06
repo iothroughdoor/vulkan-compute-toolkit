@@ -81,18 +81,153 @@ pub enum KernelError {
     UnsupportedDescriptorType,
 }
 
+#[derive(Debug, Error)]
+pub enum DeviceVariableError {
+    #[error("Creation of buffer failed")]
+    BufferCreation,
+    #[error(
+        "Requirements of buffer on memory is incompatible with the memory types the device offers"
+    )]
+    BufferMemoryIncompatibility,
+    #[error("Device memory allocation failed")]
+    DeviceMemoryAllocation,
+    #[error("Binding memory to buffer failed")]
+    BindingMemoryToBuffer,
+}
+
+pub struct DeviceVariable<'a> {
+    cctx: &'a ComputeContext,
+    buffer: vk::Buffer,
+    dev_memory: vk::DeviceMemory,
+}
+
+impl<'a> DeviceVariable<'a> {
+    fn builder() -> DeviceVariableBuilder {
+        DeviceVariableBuilder::default()
+    }
+}
+
+impl<'a> Drop for DeviceVariable<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            self.cctx.device.destroy_buffer(self.buffer, None);
+            self.cctx.device.free_memory(self.dev_memory, None);
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct DeviceVariableBuilder {
+    size_: u64,
+    host_to_dev_transf_: bool,
+    dev_to_host_transf_: bool,
+    is_uniformly_readonly_: bool,
+    use_host_caching_: bool,
+}
+
+impl DeviceVariableBuilder {
+    fn size(mut self, x: u64) -> DeviceVariableBuilder {
+        self.size_ = x;
+        self
+    }
+
+    fn host_to_dev_transf(mut self, x: bool) -> DeviceVariableBuilder {
+        self.host_to_dev_transf_ = x;
+        self
+    }
+
+    fn dev_to_host_transf(mut self, x: bool) -> DeviceVariableBuilder {
+        self.dev_to_host_transf_ = x;
+        self
+    }
+
+    fn is_uniformly_read(mut self, x: bool) -> DeviceVariableBuilder {
+        self.is_uniformly_readonly_ = x;
+        self
+    }
+
+    fn use_host_caching(mut self, x: bool) -> DeviceVariableBuilder {
+        self.use_host_caching_ = x;
+        self
+    }
+
+    fn build<'a>(self, cctx: &'a ComputeContext) -> Result<DeviceVariable, DeviceVariableError> {
+        let mut buffer_usage = vk::BufferUsageFlags::empty();
+        if self.host_to_dev_transf_ {
+            buffer_usage |= vk::BufferUsageFlags::TRANSFER_DST;
+        }
+        if self.dev_to_host_transf_ {
+            buffer_usage |= vk::BufferUsageFlags::TRANSFER_SRC;
+        }
+        if self.is_uniformly_readonly_ {
+            // for small, constant values, that are read by multiple threads in a local workgroup
+            // this is what nvidia calls constant memory
+            buffer_usage |= vk::BufferUsageFlags::UNIFORM_BUFFER;
+        } else {
+            buffer_usage |= vk::BufferUsageFlags::STORAGE_BUFFER;
+        }
+
+        let mut memory_properties = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        if self.use_host_caching_ {
+            // only necessary for host - device transfers
+            // stuff is cached on host side,
+            // speeds up transfer
+            memory_properties |= vk::MemoryPropertyFlags::HOST_CACHED;
+        }
+
+        let buffer_create_info = vk::BufferCreateInfo::default()
+            .usage(buffer_usage)
+            .size(self.size_)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe {
+            cctx.device
+                .create_buffer(&buffer_create_info, None)
+                .map_err(|_| DeviceVariableError::BufferCreation)?
+        };
+
+        let buffer_memory_requirements =
+            unsafe { cctx.device.get_buffer_memory_requirements(buffer) };
+        let elligible_memory_type_index = find_memory_type_index(
+            buffer_memory_requirements.memory_type_bits,
+            &memory_properties,
+            &cctx.memory_properties,
+        )
+        .ok_or(DeviceVariableError::BufferMemoryIncompatibility)?;
+
+        let memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(buffer_memory_requirements.size)
+            .memory_type_index(elligible_memory_type_index);
+        let dev_memory = unsafe {
+            cctx.device
+                .allocate_memory(&memory_allocate_info, None)
+                .map_err(|_| DeviceVariableError::DeviceMemoryAllocation)?
+        };
+        unsafe {
+            cctx.device
+                .bind_buffer_memory(buffer, dev_memory, 0)
+                .map_err(|_| DeviceVariableError::BindingMemoryToBuffer)?
+        };
+
+        Ok(DeviceVariable::<'a> {
+            cctx,
+            buffer,
+            dev_memory,
+        })
+    }
+}
+
 pub struct Kernel<'a> {
     device: Device,
     res_mgr: &'a KernelResourceManager,
 
     pipeline: vk::Pipeline,
     descriptor_set: vk::DescriptorSet,
-    buffers: Vec<vk::Buffer>,
-    memory: Vec<vk::DeviceMemory>,
+    binding_nrs: Vec<u32>,
+    descriptor_types: Vec<vk::DescriptorType>,
 }
 
 pub struct KernelArgInfo {
-    is_writeable: bool,
+    is_uniformly_readonly: bool,
     size: u64,
 }
 
@@ -115,11 +250,11 @@ impl<'a> Kernel<'a> {
             .collect::<Result<Vec<u32>, KernelError>>()?;
         let descriptor_types = arg_infos
             .iter()
-            .map(|&info| {
-                if info.is_writeable {
-                    vk::DescriptorType::STORAGE_BUFFER
-                } else {
+            .map(|info| {
+                if info.is_uniformly_readonly {
                     vk::DescriptorType::UNIFORM_BUFFER
+                } else {
+                    vk::DescriptorType::STORAGE_BUFFER
                 }
             })
             .collect::<Vec<vk::DescriptorType>>();
@@ -134,43 +269,9 @@ impl<'a> Kernel<'a> {
             create_descriptor_set_layout(&cctx.device, &binding_nrs, &descriptor_types)?;
         let pipeline = create_pipeline(&cctx.device, &[descriptor_set_layout], shader_module)?;
 
-        let mut buffers_with_memory: (Vec<vk::Buffer>, Vec<vk::DeviceMemory>) = (vec![], vec![]);
-        let memory_prop_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        for (i, &dt) in descriptor_types.iter().enumerate() {
-            let mut buffer_usage_flags = vk::BufferUsageFlags::TRANSFER_DST;
-            match dt {
-                vk::DescriptorType::UNIFORM_BUFFER => {
-                    buffer_usage_flags |= vk::BufferUsageFlags::UNIFORM_BUFFER
-                }
-                vk::DescriptorType::STORAGE_BUFFER => {
-                    buffer_usage_flags |= vk::BufferUsageFlags::STORAGE_BUFFER
-                }
-                /* :TODO: Consider the other descriptor types: are they relevant for compute
-                kernels? IMAGE and TEXEL Buffers might be. What about samplers? */
-                _ => return Err(KernelError::UnsupportedDescriptorType),
-            }
-            let (buffer, buffer_memory) = create_buffer_with_memory(
-                cctx,
-                buffer_usage_flags,
-                memory_prop_flags,
-                arg_infos[i].size,
-            )
-            .map_err(|e| KernelError::KernelResourceManager(e))?;
-            buffers_with_memory.0.push(buffer);
-            buffers_with_memory.1.push(buffer_memory);
-        }
-
         let descriptor_set = res_mgr
             .allocate_descriptor_set(descriptor_set_layout)
             .map_err(|e| KernelError::KernelResourceManager(e))?;
-
-        bind_descriptor_set_to_buffer(
-            &cctx.device,
-            descriptor_set,
-            &binding_nrs,
-            &descriptor_types,
-            &buffers_with_memory.0,
-        )?;
 
         unsafe {
             cctx.device
@@ -182,8 +283,6 @@ impl<'a> Kernel<'a> {
             res_mgr: &res_mgr,
             pipeline,
             descriptor_set,
-            buffers: buffers_with_memory.0,
-            memory: buffers_with_memory.1,
         })
     }
 }
@@ -193,12 +292,6 @@ impl<'a> Drop for Kernel<'a> {
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
             self.res_mgr.free_descriptor_set(self.descriptor_set);
-            for buffer in std::mem::take(&mut self.buffers) {
-                self.device.destroy_buffer(buffer, None);
-            }
-            for mem in std::mem::take(&mut self.memory) {
-                self.device.free_memory(mem, None);
-            }
         }
     }
 }
@@ -207,16 +300,6 @@ impl<'a> Drop for Kernel<'a> {
 pub enum KernelResourceManagerError {
     #[error("Creating the buffer pool failed")]
     Creation,
-    #[error("Creation of buffer failed")]
-    BufferCreation,
-    #[error(
-        "Requirements of buffer on memory is incompatible with the memory types the device offers"
-    )]
-    BufferMemoryIncompatibility,
-    #[error("Device memory allocation failed")]
-    DeviceMemoryAllocation,
-    #[error("Binding memory to buffer failed")]
-    BindingMemoryToBuffer,
     #[error("Allocating descriptor set failed")]
     DescriptorSetAllocation,
 }
@@ -316,6 +399,8 @@ pub enum DispatcherError {
     FenceCreation,
     #[error("Waiting on fence failed")]
     WaitingOnFence,
+    #[error("Resetting of fence failed")]
+    ResettingFence,
 }
 
 #[derive(Default, Clone)]
@@ -323,9 +408,9 @@ struct ComputeStream {
     max_submissions_in_flight: u32, //< number of command buffers per stream that can be in
     // use simultaneously
     compute_queue: vk::Queue,
-    exec_kernel_submission_slots: Vec<(vk::CommandBuffer, vk::Fence)>,
-    transfer_h2d_submission_slots: Vec<(vk::CommandBuffer, vk::Fence)>,
-    transfer_d2h_submission_slots: Vec<(vk::CommandBuffer, vk::Fence)>,
+    exec_kernel_submission_slots: Vec<(vk::CommandBuffer, vk::Fence, vk::Semaphore)>,
+    transfer_h2d_submission_slots: Vec<(vk::CommandBuffer, vk::Fence, vk::Semaphore)>,
+    transfer_d2h_submission_slots: Vec<(vk::CommandBuffer, vk::Fence, vk::Semaphore)>,
     next_submission_slot: usize,
 }
 
@@ -475,7 +560,7 @@ impl<'a> Dispatcher<'a> {
         unsafe { self.cctx.device.destroy_buffer(stage.0, None) };
     }
 
-    fn upload_arguments(
+    fn submit_argument_upload(
         &self,
         kernel: &Kernel,
         stage: (vk::Buffer, vk::DeviceMemory),
@@ -535,33 +620,23 @@ impl<'a> Dispatcher<'a> {
         unsafe { self.cctx.device.end_command_buffer(command_buffer) }
             .map_err(|_| DispatcherError::EndingCommandBuffer)?;
         let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        unsafe {
-            self.cctx
-                .device
-                .queue_submit(queue, &[submit_info], fence)
-        }
-        .map_err(|_| DispatcherError::ComputeQueueSubmission)?;
+        unsafe { self.cctx.device.queue_submit(queue, &[submit_info], fence) }
+            .map_err(|_| DispatcherError::ComputeQueueSubmission)?;
 
-        Ok(())
-    }
-
-    fn launch(
-        &self,
-        kernel: &Kernel,
-        command_buffer: vk::CommandBuffer,
-        compute_queue: vk::Queue,
-    ) -> Result<(), DispatcherError> {
         Ok(())
     }
 
     fn get_next_submission_slots(
         &mut self,
         stream_nr: usize,
-    ) -> Result<[(vk::CommandBuffer, vk::Fence); 3], DispatcherError> {
+    ) -> Result<[(vk::CommandBuffer, vk::Fence, vk::Semaphore); 3], DispatcherError> {
         let stream = &mut self.compute_streams[stream_nr];
-        let exec_kernel_submission_slot = stream.exec_kernel_submission_slots[stream.next_submission_slot];
-        let transfer_h2d_submission_slot = stream.transfer_h2d_submission_slots[stream.next_submission_slot];
-        let transfer_d2h_submission_slot = stream.transfer_d2h_submission_slots[stream.next_submission_slot];
+        let exec_kernel_submission_slot =
+            stream.exec_kernel_submission_slots[stream.next_submission_slot];
+        let transfer_h2d_submission_slot =
+            stream.transfer_h2d_submission_slots[stream.next_submission_slot];
+        let transfer_d2h_submission_slot =
+            stream.transfer_d2h_submission_slots[stream.next_submission_slot];
         unsafe {
             self.cctx.device.wait_for_fences(
                 &[
@@ -574,6 +649,14 @@ impl<'a> Dispatcher<'a> {
             )
         }
         .map_err(|_| DispatcherError::WaitingOnFence)?;
+        unsafe {
+            self.cctx.device.reset_fences(&[
+                exec_kernel_submission_slot.1,
+                transfer_h2d_submission_slot.1,
+                transfer_d2h_submission_slot.1,
+            ])
+        }
+        .map_err(|_| DispatcherError::ResettingFence)?;
         stream.next_submission_slot =
             (stream.next_submission_slot + 1) % (Self::MAX_SUBMISSIONS_IN_FLIGHT as usize);
 
@@ -582,6 +665,82 @@ impl<'a> Dispatcher<'a> {
             transfer_h2d_submission_slot,
             transfer_d2h_submission_slot,
         ])
+    }
+
+    fn submit_launch(
+        &self,
+        kernel: &Kernel,
+        args: &[DeviceVariable],
+        subm_slot: (vk::CommandBuffer, vk::Fence),
+        compute_queue: vk::Queue,
+    ) -> Result<(), DispatcherError> {
+        let command_buffer = subm_slot.0;
+        let fence = subm_slot.1;
+
+        let buffers = args.iter().map(|dev_var| dev_var.buffer).collect::<Vec<vk::Buffer>>();
+
+        bind_descriptor_set_to_buffer(
+            &self.cctx.device,
+            kernel.descriptor_set,
+            &kernel.binding_nrs,
+            &kernel.descriptor_types,
+            &buffers,
+        );
+
+        let compute_command_buffer_begin_info = vk::CommandBufferBeginInfo::default();
+        let submit_info = vk::SubmitInfo::default().command_buffers(&[subm_slot.0]);
+        unsafe {
+            self.cctx
+                .device
+                .begin_command_buffer(ompute_command_buffer, &compute_command_buffer_begin_info)
+                .map_err(|_| Error::GpuError("Begin compute command buffer failed.".into()))?;
+
+            vk_ctx.device.cmd_bind_pipeline(
+                vk_ctx.compute_command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                kernel
+                    .compute_pipeline
+                    .expect("No pipeline found for kernel"),
+            );
+            vk_ctx.device.cmd_bind_descriptor_sets(
+                vk_ctx.compute_command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                kernel
+                    .compute_pipeline_layout
+                    .expect("No pipeline layout found for kernel"),
+                0,
+                std::slice::from_ref(&kernel.descriptor_set),
+                &[],
+            );
+            vk_ctx.device.cmd_dispatch(
+                vk_ctx.compute_command_buffer,
+                group_x_count,
+                group_y_count,
+                1,
+            );
+
+            vk_ctx
+                .device
+                .end_command_buffer(vk_ctx.compute_command_buffer)
+                .map_err(|_| Error::GpuError("End compute command buffer failed.".into()))?;
+            vk_ctx
+                .device
+                .queue_submit(
+                    vk_ctx.compute_queue,
+                    std::slice::from_ref(&submit_info),
+                    vk::Fence::null(),
+                )
+                .map_err(|_| {
+                    Error::GpuError(
+                        "Memcpy from host to device failed: Cmd buffer submission failed.".into(),
+                    )
+                })?;
+            vk_ctx.device
+            .queue_wait_idle(vk_ctx.compute_queue)
+            .map_err(|_| { Error::GpuError("Memcpy from host to device failed: waiting on queue to become idle aborted unexpectedly.".into()) })?;
+        }
+
+        Ok(())
     }
 
     pub fn dispatch(
@@ -593,10 +752,12 @@ impl<'a> Dispatcher<'a> {
         let stage = self.create_stage(kernel)?;
 
         let compute_queue = self.compute_streams[stream_nr].compute_queue;
-        let [exec_subm_slot, h2d_subm_slot, d2h_subm_slot] = self.get_next_submission_slots(stream_nr)?;
+        let [exec_subm_slot, h2d_subm_slot, d2h_subm_slot] =
+            self.get_next_submission_slots(stream_nr)?;
 
-        self.upload_arguments(kernel, stage, &arg_vals, h2d_subm_slot, compute_queue)?;
-        self.launch(kernel)?;
+        self.submit_argument_upload(kernel, stage, &arg_vals, h2d_subm_slot, compute_queue)?;
+        self.submit_launch(kernel, exec_subm_slot, compute_queue)?;
+        // self.submit_argument_download
 
         self.destroy_stage(stage);
 
@@ -724,46 +885,6 @@ fn create_logical_device(
     }
 }
 
-fn create_buffer_with_memory(
-    cctx: &ComputeContext,
-    buffer_usages: vk::BufferUsageFlags,
-    requested_memory_properties: vk::MemoryPropertyFlags,
-    size: u64,
-) -> Result<(vk::Buffer, vk::DeviceMemory), KernelResourceManagerError> {
-    let buffer_create_info = vk::BufferCreateInfo::default()
-        .usage(buffer_usages)
-        .size(size)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer = unsafe {
-        cctx.device
-            .create_buffer(&buffer_create_info, None)
-            .map_err(|_| KernelResourceManagerError::BufferCreation)?
-    };
-
-    let buffer_memory_requirements = unsafe { cctx.device.get_buffer_memory_requirements(buffer) };
-    let elligible_memory_type_index = find_memory_type_index(
-        buffer_memory_requirements.memory_type_bits,
-        &requested_memory_properties,
-        &cctx.memory_properties,
-    )
-    .ok_or(KernelResourceManagerError::BufferMemoryIncompatibility)?;
-
-    let memory_allocate_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(buffer_memory_requirements.size)
-        .memory_type_index(elligible_memory_type_index);
-    let device_memory = unsafe {
-        cctx.device
-            .allocate_memory(&memory_allocate_info, None)
-            .map_err(|_| KernelResourceManagerError::DeviceMemoryAllocation)?
-    };
-    unsafe {
-        cctx.device
-            .bind_buffer_memory(buffer, device_memory, 0)
-            .map_err(|_| KernelResourceManagerError::BindingMemoryToBuffer)?
-    };
-    Ok((buffer, device_memory))
-}
-
 fn find_memory_type_index(
     buffer_required_memory_type: u32,
     requested_memory_properties: &vk::MemoryPropertyFlags,
@@ -787,7 +908,7 @@ fn bind_descriptor_set_to_buffer(
     binding_nrs: &[u32],
     descriptor_types: &[vk::DescriptorType],
     buffers: &[vk::Buffer],
-) -> Result<(), KernelError> {
+) {
     let mut writes: Vec<vk::WriteDescriptorSet> = vec![];
     let mut buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = vec![];
     for i in 0..binding_nrs.len() {
@@ -810,7 +931,6 @@ fn bind_descriptor_set_to_buffer(
     unsafe {
         device.update_descriptor_sets(&writes, &[]);
     }
-    Ok(())
 }
 
 fn create_pipeline(
