@@ -2,7 +2,9 @@ mod device_loading;
 mod workload;
 
 pub use device_loading::Dispatcher;
-pub use workload::{DeviceTransferable, Kernel, KernelArgInfo, KernelResourceManager};
+pub use workload::{
+    DeviceTransferable, DeviceVariable, Kernel, KernelArgInfo, KernelResourceManager,
+};
 
 use ash::{Device, Entry, Instance, vk};
 use std::ffi::{CStr, CString};
@@ -245,46 +247,111 @@ fn find_memory_type_index(
 mod tests {
     use super::*;
 
-    struct KernelArgFloatVec {
-        data: Vec<f32>,
-    }
-
-    impl DeviceTransferable for KernelArgFloatVec {
+    impl<T: Copy> DeviceTransferable for Vec<T> {
         fn cpy_to(&self, ptr: *mut std::ffi::c_void, offset: usize) {
             let mem_typed = unsafe {
-                std::slice::from_raw_parts_mut::<f32>(
-                    ptr.add(offset).cast(),
-                    self.data.len() as usize,
-                )
+                std::slice::from_raw_parts_mut::<T>(ptr.add(offset).cast(), self.len() as usize)
             };
-            mem_typed.copy_from_slice(&self.data);
+            mem_typed.copy_from_slice(self);
         }
 
         fn cpy_from(&mut self, ptr: *const std::ffi::c_void, offset: usize) {
             let mem_typed = unsafe {
-                std::slice::from_raw_parts::<f32>(ptr.add(offset).cast(), self.data.len() as usize)
+                std::slice::from_raw_parts::<T>(ptr.add(offset).cast(), self.len() as usize)
             };
-            self.data.copy_from_slice(mem_typed);
+            self.copy_from_slice(mem_typed);
         }
     }
 
     #[test]
-    fn smoke() {
+    fn smoke_cctx_creation() {
+        ComputeContext::new("App", 0).expect("Compute context creation failed");
+    }
+
+    #[test]
+    fn smoke_kernel_res_mgr_creation() {
+        let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
+        KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
+    }
+
+    #[test]
+    fn smoke_kernel_creation_inv_shader() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
         let res_mgr =
             KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
         let shader_dummy = &[0u32];
-        let arg = KernelArgFloatVec {
-            data: vec![1.0, 2.0, 3.0],
-        };
+        let data = vec![1.0, 2.0, 3.0];
         let arg_infos = vec![KernelArgInfo {
             is_uniformly_readonly: true,
-            size: (std::mem::size_of::<f32>() * arg.data.len())
+            size: (std::mem::size_of::<f32>() * data.len())
                 .try_into()
                 .expect("Cast from usize to u64 not possible"),
         }];
         if let Ok(_kernel) = Kernel::new(&cctx, &res_mgr, shader_dummy, arg_infos) {
             panic!("Why is the shader valid?");
         }
+    }
+
+    #[test]
+    fn smoke_kernel_creation_valid_shader() {
+        let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
+        let res_mgr =
+            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
+        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let mut shader = Vec::<u32>::new();
+        for bytes in shader_bytes.chunks_exact(4) {
+            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let data = vec![1.0, 2.0, 3.0];
+        let arg_infos = vec![KernelArgInfo {
+            is_uniformly_readonly: true,
+            size: (std::mem::size_of::<f32>() * data.len())
+                .try_into()
+                .expect("Cast from usize to u64 not possible"),
+        }];
+        Kernel::new(&cctx, &res_mgr, &shader, arg_infos).expect("Kernel creation failed");
+    }
+
+    #[test]
+    fn smoke_submit_upload() {
+        let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
+        let res_mgr =
+            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
+        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let mut shader = Vec::<u32>::new();
+        for bytes in shader_bytes.chunks_exact(4) {
+            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let float_data = vec![1.0, 2.0, 3.0];
+        let uint_data = vec![float_data.len().try_into().expect("too large for u32")];
+        let arg_infos = vec![
+            KernelArgInfo {
+                is_uniformly_readonly: true,
+                size: std::mem::size_of::<u32> as u64,
+            },
+            KernelArgInfo {
+                is_uniformly_readonly: false,
+                size: (std::mem::size_of::<f32>() * float_data.len())
+                    .try_into()
+                    .expect("Cast from usize to u64 not possible"),
+            },
+        ];
+        Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone()).expect("Kernel creation failed");
+
+        let len = DeviceVariable::builder()
+            .host_to_dev_transf(true)
+            .is_uniformly_read(true)
+            .size(std::mem::size_of::<u32>() as u64)
+            .build(&cctx)
+            .expect("build len device variable failed");
+        let float_array = DeviceVariable::builder()
+            .host_to_dev_transf(true)
+            .is_uniformly_read(false)
+            .size((float_data.len() * std::mem::size_of::<f32>()) as u64)
+            .build(&cctx)
+            .expect("building device variable failed");
+
+        let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+        dispatcher.submit_upload(&[len, float_array], &[Box::<Vec<u32>>::new(uint_data), Box::<Vec<f32>>::new(float_data)], 0).expect("upload submission failed");
     }
 }

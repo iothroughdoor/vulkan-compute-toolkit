@@ -169,6 +169,7 @@ pub struct Kernel<'a, 'b> {
     pub(crate) descriptor_types: Vec<vk::DescriptorType>,
 }
 
+#[derive(Clone)]
 pub struct KernelArgInfo {
     pub is_uniformly_readonly: bool,
     pub size: u64,
@@ -265,6 +266,7 @@ impl KernelResourceManager {
         let descriptor_pool_sizes = [descriptor_pool_size_storage, descriptor_pool_size_uniform];
         let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&descriptor_pool_sizes)
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .max_sets(desc_count); // if multiple compute shaders are active operating on multiple objects,
         // we need a descriptor set for every such shader / object
         let descriptor_pool = unsafe {
