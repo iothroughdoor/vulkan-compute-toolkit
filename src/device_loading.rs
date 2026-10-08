@@ -317,7 +317,7 @@ impl<'a> Dispatcher<'a> {
         Ok(())
     }
 
-    pub fn submit_download(
+    pub fn download_sync(
         &mut self,
         dev_vars: &[DeviceVariable],
         host_vars: &mut [&mut dyn DeviceTransferable],

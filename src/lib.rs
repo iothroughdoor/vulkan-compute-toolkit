@@ -3,7 +3,7 @@ mod workload;
 
 pub use device_loading::Dispatcher;
 pub use workload::{
-    DeviceTransferable, DeviceVariable, Kernel, KernelArgInfo, KernelResourceManager,
+    DeviceTransferable, DeviceVariable, Kernel, KernelArgInfo,
 };
 
 use ash::{Device, Entry, Instance, vk};
@@ -27,6 +27,8 @@ pub enum Error {
     PhysicalDeviceEnumeration(vk::Result),
     #[error("No physical device with transfer and computation queue found")]
     NoSuitablePhysicalDevice,
+    #[error("Creating the descriptor pool failed: {0}")]
+    Creation(vk::Result),
 }
 
 #[derive(Debug, Error)]
@@ -41,44 +43,48 @@ pub enum ComputeContextError {
     PipelineLayoutCreation(vk::Result),
     #[error("Creating command pool failed: {0}")]
     CmdPoolCreation(vk::Result),
+    #[error("Allocating descriptor set failed: {0}")]
+    DescriptorSetAllocation(vk::Result),
+    #[error("Freeing descriptor set failed: {0}")]
+    FreeingDescriptorSet(vk::Result),
     #[error("Vulkan error: {0}")]
     VulkanError(#[from] Error),
 }
 
 #[derive(Clone)]
 pub struct ComputeContext {
-    vk_instance: Instance,
     dev: Device,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     comp_queue_fam_idx: u32,
     comp_queue_fam_props: vk::QueueFamilyProperties,
+    descr_pool: vk::DescriptorPool,
 }
 
 impl ComputeContext {
+    const DESCRIPTOR_COUNT: u32 = 10;
+
     pub fn new(app_name: &str, app_version: u32) -> Result<ComputeContext, ComputeContextError> {
         let vk_instance = create_vk_instance(
             &CString::new(app_name).map_err(|_| ComputeContextError::CStringCreation)?,
             app_version,
         )?;
-        let (physical_device, compute_queue_family_index, compute_queue_family_props) =
+        let (physical_device, comp_queue_fam_idx, comp_queue_fam_props) =
             select_physical_device(&vk_instance)?;
-        let device = create_logical_device(
+        let dev = create_logical_device(
             &vk_instance,
             physical_device,
-            compute_queue_family_index,
-            compute_queue_family_props.queue_count,
+            comp_queue_fam_idx,
+            comp_queue_fam_props.queue_count,
         )?;
-        let memory_properties =
+        let mem_props =
             unsafe { vk_instance.get_physical_device_memory_properties(physical_device) };
-        // for now, we default to queue zero; in the future, we should do a more thoughtful
-        // selection; probably round-robin at least?
-        //let compute_queue = unsafe { device.get_device_queue(compute_queue_family_index, 0) };
+        let descr_pool = create_descriptor_pool(&dev, Self::DESCRIPTOR_COUNT)?;
         Ok(ComputeContext {
-            vk_instance,
-            dev: device,
-            mem_props: memory_properties,
-            comp_queue_fam_idx: compute_queue_family_index,
-            comp_queue_fam_props: compute_queue_family_props,
+            dev,
+            mem_props,
+            comp_queue_fam_idx,
+            comp_queue_fam_props,
+            descr_pool,
         })
     }
 
@@ -121,6 +127,36 @@ impl ComputeContext {
         }
     }
 
+    fn allocate_descriptor_set(
+        &self,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet, ComputeContextError> {
+        let layouts = [descriptor_set_layout];
+        let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descr_pool)
+            .set_layouts(&layouts);
+        let descriptor_sets = unsafe {
+            self.dev
+                .allocate_descriptor_sets(&descriptor_set_allocate_info)
+        }
+        .map_err(|e| ComputeContextError::DescriptorSetAllocation(e))?;
+
+        Ok(descriptor_sets[0])
+    }
+
+    fn free_descriptor_set(
+        &self,
+        descriptor_set: vk::DescriptorSet,
+    ) -> Result<(), ComputeContextError> {
+        unsafe {
+            self.dev
+                .free_descriptor_sets(self.descr_pool, &[descriptor_set])
+        }
+        .map_err(|e| ComputeContextError::FreeingDescriptorSet(e))?;
+
+        Ok(())
+    }
+
     fn create_pipeline(
         &self,
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
@@ -152,6 +188,14 @@ impl ComputeContext {
         }
 
         Ok((pipelines[0], pipeline_layout))
+    }
+}
+
+impl Drop for ComputeContext {
+    fn drop(&mut self) {
+        unsafe {
+            self.dev.destroy_descriptor_pool(self.descr_pool, None);
+        }
     }
 }
 
@@ -248,6 +292,26 @@ fn find_memory_type_index(
     None
 }
 
+fn create_descriptor_pool(dev: &Device, desc_count: u32) -> Result<vk::DescriptorPool, Error> {
+    let descriptor_pool_size_storage = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(desc_count); // bound by max_sets, but in principle this can be lower
+    let descriptor_pool_size_uniform = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(desc_count); // bound by max_sets, but in principle this can be lower
+    let descriptor_pool_sizes = [descriptor_pool_size_storage, descriptor_pool_size_uniform];
+    let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(&descriptor_pool_sizes)
+        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+        .max_sets(desc_count); // if multiple compute shaders are active operating on multiple objects,
+    // we need a descriptor set for every such shader / object
+    let descriptor_pool = unsafe {
+        dev.create_descriptor_pool(&descriptor_pool_create_info, None)
+            .map_err(|e| Error::Creation(e))?
+    };
+    Ok(descriptor_pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,16 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn smoke_kernel_res_mgr_creation() {
-        let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
-    }
-
-    #[test]
     fn smoke_kernel_creation_inv_shader() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let res_mgr =
-            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
         let shader_dummy = &[0u32];
         let data = vec![1.0, 2.0, 3.0];
         let arg_infos = vec![KernelArgInfo {
@@ -296,7 +352,7 @@ mod tests {
                 .try_into()
                 .expect("Cast from usize to u64 not possible"),
         }];
-        if let Ok(_kernel) = Kernel::new(&cctx, &res_mgr, shader_dummy, arg_infos) {
+        if let Ok(_kernel) = Kernel::new(&cctx, shader_dummy, arg_infos) {
             panic!("Why is the shader valid?");
         }
     }
@@ -304,8 +360,6 @@ mod tests {
     #[test]
     fn smoke_kernel_creation_valid_shader() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let res_mgr =
-            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
         let mut shader = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
@@ -318,14 +372,12 @@ mod tests {
                 .try_into()
                 .expect("Cast from usize to u64 not possible"),
         }];
-        Kernel::new(&cctx, &res_mgr, &shader, arg_infos).expect("Kernel creation failed");
+        Kernel::new(&cctx, &shader, arg_infos).expect("Kernel creation failed");
     }
 
     #[test]
     fn smoke_submit_upload() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let res_mgr =
-            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
         let mut shader = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
@@ -345,7 +397,7 @@ mod tests {
                     .expect("Cast from usize to u64 not possible"),
             },
         ];
-        Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone()).expect("Kernel creation failed");
+        Kernel::new(&cctx, &shader, arg_infos.clone()).expect("Kernel creation failed");
 
         let len = DeviceVariable::builder()
             .host_to_dev_transf(true)
@@ -374,8 +426,6 @@ mod tests {
     #[test]
     fn smoke_full_loop() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let res_mgr =
-            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
         let mut shader = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
@@ -395,7 +445,7 @@ mod tests {
                     .expect("Cast from usize to u64 not possible"),
             },
         ];
-        let kernel = Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone())
+        let kernel = Kernel::new(&cctx, &shader, arg_infos.clone())
             .expect("Kernel creation failed");
 
         let len = DeviceVariable::builder()
@@ -432,10 +482,6 @@ mod tests {
             .download_sync(&variables, host_variables, 0)
             .expect("upload submission failed");
 
-        //dispatcher
-        //    .sync_stream(0)
-        //    .expect("Waiting on stream to finish its work has been cancelled unexpectedly");
-
         assert_eq!(uint_data[0], 3);
         assert_eq!(float_data, [2.0, 3.0, 4.0]);
     }
@@ -443,8 +489,6 @@ mod tests {
     #[test]
     fn two_kernels() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let res_mgr =
-            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
         let mut shader = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
@@ -464,9 +508,9 @@ mod tests {
                     .expect("Cast from usize to u64 not possible"),
             },
         ];
-        let kernel_1 = Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone())
+        let kernel_1 = Kernel::new(&cctx, &shader, arg_infos.clone())
             .expect("Kernel creation failed");
-        let kernel_2 = Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone())
+        let kernel_2 = Kernel::new(&cctx, &shader, arg_infos.clone())
             .expect("Kernel creation failed");
 
         let len = DeviceVariable::builder()
@@ -505,10 +549,6 @@ mod tests {
         dispatcher
             .download_sync(&variables, host_variables, 0)
             .expect("upload submission failed");
-
-        //dispatcher
-        //    .sync_stream(0)
-        //    .expect("Waiting on stream to finish its work has been cancelled unexpectedly");
 
         assert_eq!(uint_data[0], 3);
         assert_eq!(float_data, [3.0, 4.0, 5.0]);
