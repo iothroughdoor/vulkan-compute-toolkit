@@ -63,7 +63,7 @@ impl ComputeContext {
         let (physical_device, compute_queue_family_index, compute_queue_family_props) =
             select_physical_device(&vk_instance)?;
         let device =
-            create_logical_device(&vk_instance, physical_device, compute_queue_family_index)?;
+            create_logical_device(&vk_instance, physical_device, compute_queue_family_index, compute_queue_family_props.queue_count)?;
         let memory_properties =
             unsafe { vk_instance.get_physical_device_memory_properties(physical_device) };
         // for now, we default to queue zero; in the future, we should do a more thoughtful
@@ -212,10 +212,12 @@ fn create_logical_device(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
+    queue_count: u32,
 ) -> Result<Device, Error> {
+    let queue_prios = vec![1.0; queue_count as usize];
     let queue_info = vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family_index)
-        .queue_priorities(&[1.0]);
+        .queue_priorities(&queue_prios);
 
     let queue_infos = &[queue_info];
     let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(queue_infos);
@@ -260,6 +262,10 @@ mod tests {
                 std::slice::from_raw_parts::<T>(ptr.add(offset).cast(), self.len() as usize)
             };
             self.copy_from_slice(mem_typed);
+        }
+
+        fn size(&self) -> usize {
+            std::mem::size_of::<T>() * self.len()
         }
     }
 
@@ -323,7 +329,7 @@ mod tests {
             shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
         let float_data = vec![1.0, 2.0, 3.0];
-        let uint_data = vec![float_data.len().try_into().expect("too large for u32")];
+        let uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
         let arg_infos = vec![
             KernelArgInfo {
                 is_uniformly_readonly: true,
@@ -352,6 +358,20 @@ mod tests {
             .expect("building device variable failed");
 
         let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
-        dispatcher.submit_upload(&[len, float_array], &[Box::<Vec<u32>>::new(uint_data), Box::<Vec<f32>>::new(float_data)], 0).expect("upload submission failed");
+        let variables = [len, float_array];
+        dispatcher
+            .submit_upload(
+                &variables,
+                &[
+                    Box::<Vec<u32>>::new(uint_data),
+                    Box::<Vec<f32>>::new(float_data),
+                ],
+                0,
+            )
+            .expect("upload submission failed");
+
+        dispatcher
+            .sync_stream(0)
+            .expect("Waiting on stream to finish its work has been cancelled unexpectedly");
     }
 }

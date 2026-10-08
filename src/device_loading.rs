@@ -51,6 +51,10 @@ pub enum DispatcherError {
     SemaphoreCreation,
     #[error("Mapping staging memory failed.")]
     MappingStagingMemory,
+    #[error("Waiting on queue to become idle failed: {0}")]
+    WaitingOnQueue(vk::Result),
+    #[error("Resetting command buffer failed: {0}")]
+    ResettingCommandBuffer(vk::Result),
 }
 
 // resources to manage submissions in flight
@@ -79,16 +83,16 @@ pub struct Dispatcher<'a> {
 }
 
 impl<'a> Dispatcher<'a> {
+    // has to be at least 2!
     const MAX_SUBMISSIONS_IN_FLIGHT: u32 = 3;
 
     pub fn new(
         cctx: &'a ComputeContext,
         requested_stream_count: u32,
     ) -> Result<Self, DispatcherError> {
-        let cmd_pool_permanent = cctx.create_command_pool(
-            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-        )
-        .map_err(|_| DispatcherError::CommandPoolCreation)?;
+        let cmd_pool_permanent = cctx
+            .create_command_pool(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .map_err(|_| DispatcherError::CommandPoolCreation)?;
 
         let max_stream_count = std::cmp::min(
             cctx.comp_queue_fam_props.queue_count,
@@ -102,17 +106,11 @@ impl<'a> Dispatcher<'a> {
             .command_pool(cmd_pool_permanent)
             .command_buffer_count(3 * max_stream_count * Self::MAX_SUBMISSIONS_IN_FLIGHT)
             .level(vk::CommandBufferLevel::PRIMARY);
-        let mut cmd_bufs = unsafe {
-            cctx.dev
-                .allocate_command_buffers(&comp_cmd_buf_alloc_info)
-        }
-        .map_err(|_| DispatcherError::CommandBufferAllocation)?;
+        let mut cmd_bufs = unsafe { cctx.dev.allocate_command_buffers(&comp_cmd_buf_alloc_info) }
+            .map_err(|_| DispatcherError::CommandBufferAllocation)?;
 
         let mut comp_queues = (0..max_stream_count)
-            .map(|i| unsafe {
-                cctx.dev
-                    .get_device_queue(cctx.comp_queue_fam_idx, i)
-            })
+            .map(|i| unsafe { cctx.dev.get_device_queue(cctx.comp_queue_fam_idx, i) })
             .collect::<Vec<vk::Queue>>();
 
         let fence_create_info =
@@ -125,9 +123,7 @@ impl<'a> Dispatcher<'a> {
                 .ok_or(DispatcherError::StreamCntQueueCntMismatch)?;
             for _ in 0..Self::MAX_SUBMISSIONS_IN_FLIGHT {
                 stream.submission_slots.push(SubmissionSlot {
-                    cmd_buf: cmd_bufs
-                        .pop()
-                        .ok_or(DispatcherError::NotEnoughBuffers)?,
+                    cmd_buf: cmd_bufs.pop().ok_or(DispatcherError::NotEnoughBuffers)?,
                     host_finish_sig: unsafe { cctx.dev.create_fence(&fence_create_info, None) }
                         .map_err(|_| DispatcherError::FenceCreation)?,
                     device_finish_sig: unsafe { cctx.dev.create_semaphore(&sem_create_info, None) }
@@ -190,24 +186,11 @@ impl<'a> Dispatcher<'a> {
                 .begin_command_buffer(cmd_buf, &command_buffer_begin_info)
         }
         .map_err(|_| DispatcherError::BeginningCommandBuffer)?;
-        unsafe {
-            self.cctx
-                .dev
-                .reset_command_buffer(cmd_buf, vk::CommandBufferResetFlags::empty())
-        };
         let mut offset: usize = 0;
         let command_buffers = [cmd_buf];
         for (val, dev_var) in arg_vals.iter().zip(dev_vars.iter()) {
             val.cpy_to(mapped_mem, offset);
-            let val_size: usize = unsafe {
-                self.cctx
-                    .dev
-                    .get_buffer_memory_requirements(dev_var.buffer)
-                    .size
-            }
-            .try_into()
-            .map_err(|_| DispatcherError::Casting)?;
-
+            let val_size = val.size();
             let copy_region = vk::BufferCopy::default()
                 .src_offset(offset.try_into().map_err(|_| DispatcherError::Casting)?)
                 .dst_offset(0)
@@ -232,6 +215,12 @@ impl<'a> Dispatcher<'a> {
         unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
             .map_err(|_| DispatcherError::ComputeQueueSubmission)?;
 
+        Ok(())
+    }
+
+    pub fn sync_stream(&self, stream_nr: usize) -> Result<(), DispatcherError> {
+        let comp_queue = self.comp_streams[stream_nr].comp_queue;
+        unsafe { self.cctx.dev.queue_wait_idle(comp_queue) }.map_err(|e| DispatcherError::WaitingOnQueue(e))?;
         Ok(())
     }
 
@@ -322,9 +311,9 @@ impl<'a> Dispatcher<'a> {
 
     fn get_current_submission_slot(&self, stream_nr: usize) -> &SubmissionSlot {
         let stream = &self.comp_streams[stream_nr];
-        let cur_subm_slot_idx = (stream.next_submission_slot_index - 1
-            + Self::MAX_SUBMISSIONS_IN_FLIGHT as usize)
-            % (Self::MAX_SUBMISSIONS_IN_FLIGHT as usize);
+        let cur_subm_slot_idx = (((stream.next_submission_slot_index as i64) - 1
+            + Self::MAX_SUBMISSIONS_IN_FLIGHT as i64)
+            % (Self::MAX_SUBMISSIONS_IN_FLIGHT as i64)) as usize;
         &stream.submission_slots[cur_subm_slot_idx]
     }
 
@@ -332,24 +321,35 @@ impl<'a> Dispatcher<'a> {
         &mut self,
         stream_nr: usize,
     ) -> Result<&mut SubmissionSlot, DispatcherError> {
-        let stream = &mut self.comp_streams[stream_nr];
-        let submission_slot = &mut stream.submission_slots[stream.next_submission_slot_index];
+        let stream = &self.comp_streams[stream_nr];
+        let subm_slot = &stream.submission_slots[stream.next_submission_slot_index];
         unsafe {
             self.cctx
                 .dev
-                .wait_for_fences(&[submission_slot.host_finish_sig], true, u64::MAX)
+                .wait_for_fences(&[subm_slot.host_finish_sig], true, u64::MAX)
         }
         .map_err(|_| DispatcherError::WaitingOnFence)?;
+        if let Some(stage) = subm_slot.stage {
+            self.destroy_stage(stage);
+        }
         unsafe {
             self.cctx
                 .dev
-                .reset_fences(&[submission_slot.host_finish_sig])
+                .reset_fences(&[subm_slot.host_finish_sig])
         }
         .map_err(|_| DispatcherError::ResettingFence)?;
+        unsafe {
+            self.cctx
+                .dev
+                .reset_command_buffer(subm_slot.cmd_buf, vk::CommandBufferResetFlags::empty())
+        }.map_err(|e| DispatcherError::ResettingCommandBuffer(e))?;
+
+        let stream = &mut self.comp_streams[stream_nr];
+        let subm_slot = &mut stream.submission_slots[stream.next_submission_slot_index];
         stream.next_submission_slot_index =
             (stream.next_submission_slot_index + 1) % (Self::MAX_SUBMISSIONS_IN_FLIGHT as usize);
 
-        Ok(submission_slot)
+        Ok(subm_slot)
     }
 }
 

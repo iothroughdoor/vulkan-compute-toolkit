@@ -178,6 +178,7 @@ pub struct KernelArgInfo {
 pub trait DeviceTransferable {
     fn cpy_from(&mut self, memory: *const core::ffi::c_void, offset: usize);
     fn cpy_to(&self, memory: *mut core::ffi::c_void, offset: usize);
+    fn size(&self) -> usize;
 }
 
 impl<'a, 'b> Kernel<'a, 'b> {
