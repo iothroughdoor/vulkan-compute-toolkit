@@ -89,6 +89,8 @@ impl<'a> Dispatcher<'a> {
         cctx: &'a ComputeContext,
         requested_stream_count: u32,
     ) -> Result<Self, DispatcherError> {
+        assert!(Self::MAX_SUBMISSIONS_IN_FLIGHT >= 2); // Can we make this a compile-time check?
+
         let cmd_pool_permanent = cctx
             .create_command_pool(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
             .map_err(|_| DispatcherError::CommandPoolCreation)?;
@@ -98,7 +100,6 @@ impl<'a> Dispatcher<'a> {
             requested_stream_count,
         );
 
-        /* Create Compute Streams */
         let mut comp_streams = vec![ComputeStream::default(); max_stream_count as usize];
 
         let comp_cmd_buf_alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -139,27 +140,17 @@ impl<'a> Dispatcher<'a> {
         })
     }
 
-    pub fn submit_upload(
+    pub fn upload_async(
         &mut self,
         dev_vars: &[DeviceVariable],
         host_vars: &[&dyn DeviceTransferable],
         stream_nr: usize,
     ) -> Result<(), DispatcherError> {
-        /* Acquire Queue and Slot */
-        let queue = self.comp_streams[stream_nr].comp_queue;
-        let wait_semaphore = self.get_wait_semaphore(stream_nr)?;
+        let subm_slot_idx = self.acquire_next_submission_slot(stream_nr)?;
         let stage = create_stage(self.cctx, dev_vars)?;
-        let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
-        let cmd_buf = subm_slot.cmd_buf;
-        let fence = subm_slot.host_finish_sig;
-        let signal_semaphore = subm_slot.device_finish_sig;
+        let subm_slot = &mut self.comp_streams[stream_nr].submission_slots[subm_slot_idx];
         subm_slot.stage = Some(stage);
-        let stage = match self.get_current_submission_slot(stream_nr).stage {
-            Some(stage) => stage,
-            None => panic!("Somehow the stage vanished magically"),
-        };
-
-        /* ----------------------------- */
+        let cmd_buf = subm_slot.cmd_buf;
 
         let total_mem_size = host_vars.iter().map(|hv| hv.size() as u64).sum();
         let mapped_mem = unsafe {
@@ -169,7 +160,6 @@ impl<'a> Dispatcher<'a> {
                 .map_err(|_| DispatcherError::MappingStagingMemory)?
         };
 
-        /* Record */
         let cmd_buf_beg_info = vk::CommandBufferBeginInfo::default();
         unsafe {
             self.cctx
@@ -195,21 +185,7 @@ impl<'a> Dispatcher<'a> {
         unsafe { self.cctx.dev.end_command_buffer(cmd_buf) }
             .map_err(|e| DispatcherError::EndingCommandBuffer(e))?;
 
-        /* Submit */
-        let cmd_bufs = [cmd_buf];
-        let wait_sems = wait_semaphore.map_or(vec![], |s| vec![s]);
-        let signal_sems = [signal_semaphore];
-        let stage_flags = wait_sems
-            .iter()
-            .map(|_| vk::PipelineStageFlags::TOP_OF_PIPE)
-            .collect::<Vec<_>>();
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&cmd_bufs)
-            .wait_semaphores(&wait_sems)
-            .wait_dst_stage_mask(&stage_flags)
-            .signal_semaphores(&signal_sems);
-        unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
-            .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
+        self.submit(stream_nr, subm_slot_idx)?;
 
         Ok(())
     }
@@ -221,31 +197,15 @@ impl<'a> Dispatcher<'a> {
         Ok(())
     }
 
-    fn get_wait_semaphore(
-        &self,
-        stream_nr: usize,
-    ) -> Result<Option<vk::Semaphore>, DispatcherError> {
-        let subm_slot = self.get_current_submission_slot(stream_nr);
-        match unsafe { self.cctx.dev.get_fence_status(subm_slot.host_finish_sig) } {
-            Ok(false) => Ok(Some(subm_slot.device_finish_sig)),
-            Ok(true) => Ok(None),
-            _ => return Err(DispatcherError::FenceStatus),
-        }
-    }
-
-    pub fn submit_launch(
+    pub fn launch_async(
         &mut self,
         kernel: &Kernel,
         args: &[DeviceVariable],
         stream_nr: usize,
         launch_config: [u32; 3],
     ) -> Result<(), DispatcherError> {
-        let queue = self.comp_streams[stream_nr].comp_queue;
-        let wait_semaphore = self.get_wait_semaphore(stream_nr)?;
-        let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
-        let cmd_buf = subm_slot.cmd_buf;
-        let fence = subm_slot.host_finish_sig;
-        let signal_semaphore = subm_slot.device_finish_sig;
+        let subm_slot_idx = self.acquire_next_submission_slot(stream_nr)?;
+        let cmd_buf = self.comp_streams[stream_nr].submission_slots[subm_slot_idx].cmd_buf;
 
         let buffers = args
             .iter()
@@ -259,8 +219,6 @@ impl<'a> Dispatcher<'a> {
             &kernel.descriptor_types,
             &buffers,
         );
-
-        /* ---------------------------------- */
 
         let cmd_buf_beg_info = vk::CommandBufferBeginInfo::default();
         unsafe {
@@ -298,21 +256,7 @@ impl<'a> Dispatcher<'a> {
         unsafe { self.cctx.dev.end_command_buffer(cmd_buf) }
             .map_err(|e| DispatcherError::EndingCommandBuffer(e))?;
 
-        /* Submit */
-        let cmd_bufs = [cmd_buf];
-        let wait_sems = wait_semaphore.map_or(vec![], |s| vec![s]);
-        let signal_sems = [signal_semaphore];
-        let stage_flags = wait_sems
-            .iter()
-            .map(|_| vk::PipelineStageFlags::TOP_OF_PIPE)
-            .collect::<Vec<_>>();
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&cmd_bufs)
-            .wait_semaphores(&wait_sems)
-            .wait_dst_stage_mask(&stage_flags)
-            .signal_semaphores(&signal_sems);
-        unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
-            .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
+        self.submit(stream_nr, subm_slot_idx)?;
 
         Ok(())
     }
@@ -323,18 +267,11 @@ impl<'a> Dispatcher<'a> {
         host_vars: &mut [&mut dyn DeviceTransferable],
         stream_nr: usize,
     ) -> Result<(), DispatcherError> {
-        let queue = self.comp_streams[stream_nr].comp_queue;
-        let wait_semaphore = self.get_wait_semaphore(stream_nr)?;
+        let subm_slot_idx = self.acquire_next_submission_slot(stream_nr)?;
         let stage = create_stage(self.cctx, dev_vars)?;
-        let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
-        let cmd_buf = subm_slot.cmd_buf;
-        let fence = subm_slot.host_finish_sig;
-        let signal_semaphore = subm_slot.device_finish_sig;
+        let subm_slot = &mut self.comp_streams[stream_nr].submission_slots[subm_slot_idx];
         subm_slot.stage = Some(stage);
-        let stage = match self.get_current_submission_slot(stream_nr).stage {
-            Some(stage) => stage,
-            None => panic!("Somehow the stage vanished magically"),
-        };
+        let cmd_buf = subm_slot.cmd_buf;
 
         let total_mem_size = host_vars.iter().map(|hv| hv.size() as u64).sum();
         let mapped_mem = unsafe {
@@ -344,7 +281,6 @@ impl<'a> Dispatcher<'a> {
                 .map_err(|_| DispatcherError::MappingStagingMemory)?
         };
 
-        /* Record */
         let cmd_buf_beg_info = vk::CommandBufferBeginInfo::default();
         unsafe {
             self.cctx
@@ -369,21 +305,9 @@ impl<'a> Dispatcher<'a> {
         unsafe { self.cctx.dev.end_command_buffer(cmd_buf) }
             .map_err(|e| DispatcherError::EndingCommandBuffer(e))?;
 
-        /* Submit */
-        let cmd_bufs = [cmd_buf];
-        let wait_sems = wait_semaphore.map_or(vec![], |s| vec![s]);
-        let signal_sems = [signal_semaphore];
-        let stage_flags = wait_sems
-            .iter()
-            .map(|_| vk::PipelineStageFlags::TOP_OF_PIPE)
-            .collect::<Vec<_>>();
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&cmd_bufs)
-            .wait_semaphores(&wait_sems)
-            .wait_dst_stage_mask(&stage_flags)
-            .signal_semaphores(&signal_sems);
-        unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
-            .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
+        self.submit(stream_nr, subm_slot_idx)?;
+
+        let fence = self.comp_streams[stream_nr].submission_slots[subm_slot_idx].host_finish_sig;
 
         unsafe { self.cctx.dev.wait_for_fences(&[fence], true, u64::MAX) }.unwrap();
 
@@ -397,23 +321,50 @@ impl<'a> Dispatcher<'a> {
         Ok(())
     }
 
-    fn destroy_stage(&self, stage: (vk::Buffer, vk::DeviceMemory)) {
-        unsafe { self.cctx.dev.unmap_memory(stage.1) };
-        unsafe { self.cctx.dev.destroy_buffer(stage.0, None) };
+    fn submit(&self, stream_nr: usize, subm_slot_idx: usize) -> Result<(), DispatcherError> {
+        let &SubmissionSlot {
+            cmd_buf,
+            host_finish_sig,
+            device_finish_sig,
+            stage: _
+        } = &self.comp_streams[stream_nr].submission_slots[subm_slot_idx];
+        let cmd_bufs = [cmd_buf];
+        let wait_sem = self.get_wait_semaphore(stream_nr, subm_slot_idx)?;
+        let wait_sems = wait_sem.map_or(vec![], |s| vec![s]);
+        let signal_sems = [device_finish_sig];
+
+        let queue = self.comp_streams[stream_nr].comp_queue;
+        let stage_flags = wait_sems
+            .iter()
+            .map(|_| vk::PipelineStageFlags::TOP_OF_PIPE)
+            .collect::<Vec<_>>();
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(&cmd_bufs)
+            .wait_semaphores(&wait_sems)
+            .wait_dst_stage_mask(&stage_flags)
+            .signal_semaphores(&signal_sems);
+        unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], host_finish_sig) }
+            .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
+
+        Ok(())
     }
 
-    fn get_current_submission_slot(&self, stream_nr: usize) -> &SubmissionSlot {
-        let stream = &self.comp_streams[stream_nr];
-        let cur_subm_slot_idx = (((stream.next_submission_slot_index as i64) - 1
-            + Self::MAX_SUBMISSIONS_IN_FLIGHT as i64)
-            % (Self::MAX_SUBMISSIONS_IN_FLIGHT as i64)) as usize;
-        &stream.submission_slots[cur_subm_slot_idx]
-    }
-
-    fn acquire_next_submission_slot(
-        &mut self,
+    fn get_wait_semaphore(
+        &self,
         stream_nr: usize,
-    ) -> Result<&mut SubmissionSlot, DispatcherError> {
+        subm_slot_idx: usize
+    ) -> Result<Option<vk::Semaphore>, DispatcherError> {
+        let prev_subm_slot_idx = (((subm_slot_idx as i64) - 1 + Self::MAX_SUBMISSIONS_IN_FLIGHT as i64)
+            % (Self::MAX_SUBMISSIONS_IN_FLIGHT as i64)) as usize;
+        let prev_subm_slot = &self.comp_streams[stream_nr].submission_slots[prev_subm_slot_idx];
+        match unsafe { self.cctx.dev.get_fence_status(prev_subm_slot.host_finish_sig) } {
+            Ok(false) => Ok(Some(prev_subm_slot.device_finish_sig)),
+            Ok(true) => Ok(None),
+            _ => return Err(DispatcherError::FenceStatus),
+        }
+    }
+
+    fn acquire_next_submission_slot(&mut self, stream_nr: usize) -> Result<usize, DispatcherError> {
         let stream = &self.comp_streams[stream_nr];
         let subm_slot = &stream.submission_slots[stream.next_submission_slot_index];
         unsafe {
@@ -423,7 +374,7 @@ impl<'a> Dispatcher<'a> {
         }
         .map_err(|_| DispatcherError::WaitingOnFence)?;
         if let Some(stage) = subm_slot.stage {
-            self.destroy_stage(stage);
+            destroy_stage(self.cctx, stage);
         }
         unsafe { self.cctx.dev.reset_fences(&[subm_slot.host_finish_sig]) }
             .map_err(|_| DispatcherError::ResettingFence)?;
@@ -435,11 +386,11 @@ impl<'a> Dispatcher<'a> {
         .map_err(|e| DispatcherError::ResettingCommandBuffer(e))?;
 
         let stream = &mut self.comp_streams[stream_nr];
-        let subm_slot = &mut stream.submission_slots[stream.next_submission_slot_index];
+        let subm_slot_idx = stream.next_submission_slot_index;
         stream.next_submission_slot_index =
             (stream.next_submission_slot_index + 1) % (Self::MAX_SUBMISSIONS_IN_FLIGHT as usize);
 
-        Ok(subm_slot)
+        Ok(subm_slot_idx)
     }
 }
 
@@ -548,4 +499,9 @@ fn create_stage(
     };
 
     Ok((staging_buffer, staging_memory))
+}
+
+fn destroy_stage(cctx: &ComputeContext, stage: (vk::Buffer, vk::DeviceMemory)) {
+    unsafe { cctx.dev.unmap_memory(stage.1) };
+    unsafe { cctx.dev.destroy_buffer(stage.0, None) };
 }

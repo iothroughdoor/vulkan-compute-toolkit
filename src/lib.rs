@@ -415,7 +415,7 @@ mod tests {
         let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
         let variables = [len, float_array];
         dispatcher
-            .submit_upload(&variables, &[&uint_data, &float_data], 0)
+            .upload_async(&variables, &[&uint_data, &float_data], 0)
             .expect("upload submission failed");
 
         dispatcher
@@ -468,11 +468,11 @@ mod tests {
         let host_variables: &[&dyn DeviceTransferable] = &[&uint_data, &float_data];
 
         dispatcher
-            .submit_upload(&variables, host_variables, 0)
+            .upload_async(&variables, host_variables, 0)
             .expect("upload submission failed");
 
         dispatcher
-            .submit_launch(&kernel, &variables, 0, [1, 1, 1])
+            .launch_async(&kernel, &variables, 0, [1, 1, 1])
             .expect("launch submission failed");
 
         uint_data[0] = 0;
@@ -533,14 +533,14 @@ mod tests {
         let host_variables: &[&dyn DeviceTransferable] = &[&uint_data, &float_data];
 
         dispatcher
-            .submit_upload(&variables, host_variables, 0)
+            .upload_async(&variables, host_variables, 0)
             .expect("upload submission failed");
 
         dispatcher
-            .submit_launch(&kernel_1, &variables, 0, [1, 1, 1])
+            .launch_async(&kernel_1, &variables, 0, [1, 1, 1])
             .expect("launch submission failed");
         dispatcher
-            .submit_launch(&kernel_2, &variables, 0, [1, 1, 1])
+            .launch_async(&kernel_2, &variables, 0, [1, 1, 1])
             .expect("launch submission failed");
 
         uint_data[0] = 0;
