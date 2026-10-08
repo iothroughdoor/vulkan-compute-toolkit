@@ -62,8 +62,12 @@ impl ComputeContext {
         )?;
         let (physical_device, compute_queue_family_index, compute_queue_family_props) =
             select_physical_device(&vk_instance)?;
-        let device =
-            create_logical_device(&vk_instance, physical_device, compute_queue_family_index, compute_queue_family_props.queue_count)?;
+        let device = create_logical_device(
+            &vk_instance,
+            physical_device,
+            compute_queue_family_index,
+            compute_queue_family_props.queue_count,
+        )?;
         let memory_properties =
             unsafe { vk_instance.get_physical_device_memory_properties(physical_device) };
         // for now, we default to queue zero; in the future, we should do a more thoughtful
@@ -121,7 +125,7 @@ impl ComputeContext {
         &self,
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
         shader_module: vk::ShaderModule,
-    ) -> Result<vk::Pipeline, ComputeContextError> {
+    ) -> Result<(vk::Pipeline, vk::PipelineLayout), ComputeContextError> {
         let pipeline_layout_create_info =
             vk::PipelineLayoutCreateInfo::default().set_layouts(descriptor_set_layouts);
         let pipeline_layout = unsafe {
@@ -145,10 +149,9 @@ impl ComputeContext {
 
         unsafe {
             self.dev.destroy_shader_module(shader_module, None);
-            self.dev.destroy_pipeline_layout(pipeline_layout, None);
         }
 
-        Ok(pipelines[0])
+        Ok((pipelines[0], pipeline_layout))
     }
 }
 
@@ -369,6 +372,68 @@ mod tests {
                 0,
             )
             .expect("upload submission failed");
+
+        dispatcher
+            .sync_stream(0)
+            .expect("Waiting on stream to finish its work has been cancelled unexpectedly");
+    }
+
+    #[test]
+    fn smoke_submit_launch() {
+        let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
+        let res_mgr =
+            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
+        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let mut shader = Vec::<u32>::new();
+        for bytes in shader_bytes.chunks_exact(4) {
+            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let float_data = vec![1.0, 2.0, 3.0];
+        let uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
+        let arg_infos = vec![
+            KernelArgInfo {
+                is_uniformly_readonly: true,
+                size: std::mem::size_of::<u32> as u64,
+            },
+            KernelArgInfo {
+                is_uniformly_readonly: false,
+                size: (std::mem::size_of::<f32>() * float_data.len())
+                    .try_into()
+                    .expect("Cast from usize to u64 not possible"),
+            },
+        ];
+        let kernel = Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone())
+            .expect("Kernel creation failed");
+
+        let len = DeviceVariable::builder()
+            .host_to_dev_transf(true)
+            .is_uniformly_read(true)
+            .size(std::mem::size_of::<u32>() as u64)
+            .build(&cctx)
+            .expect("build len device variable failed");
+        let float_array = DeviceVariable::builder()
+            .host_to_dev_transf(true)
+            .is_uniformly_read(false)
+            .size((float_data.len() * std::mem::size_of::<f32>()) as u64)
+            .build(&cctx)
+            .expect("building device variable failed");
+
+        let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+        let variables = [len, float_array];
+        dispatcher
+            .submit_upload(
+                &variables,
+                &[
+                    Box::<Vec<u32>>::new(uint_data),
+                    Box::<Vec<f32>>::new(float_data),
+                ],
+                0,
+            )
+            .expect("upload submission failed");
+
+        dispatcher
+            .submit_launch(&kernel, &variables, 0, [3, 0, 0])
+            .expect("launch submission failed");
 
         dispatcher
             .sync_stream(0)

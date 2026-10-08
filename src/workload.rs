@@ -164,7 +164,9 @@ pub struct Kernel<'a, 'b> {
     res_mgr: &'a KernelResourceManager,
 
     pub(crate) pipeline: vk::Pipeline,
+    pub(crate) pipeline_layout: vk::PipelineLayout,
     pub(crate) descriptor_set: vk::DescriptorSet,
+    descriptor_set_layout: vk::DescriptorSetLayout,
     pub(crate) binding_nrs: Vec<u32>,
     pub(crate) descriptor_types: Vec<vk::DescriptorType>,
 }
@@ -212,24 +214,22 @@ impl<'a, 'b> Kernel<'a, 'b> {
         }?;
         let descriptor_set_layout =
             cctx.create_descriptor_set_layout(&binding_nrs, &descriptor_types)?;
-        let pipeline = cctx.create_pipeline(&[descriptor_set_layout], shader_module)?;
+        let (pipeline, pipeline_layout) =
+            cctx.create_pipeline(&[descriptor_set_layout], shader_module)?;
 
         let descriptor_set = res_mgr
             .allocate_descriptor_set(descriptor_set_layout)
             .map_err(|e| KernelError::KernelResourceManager(e))?;
 
-        unsafe {
-            cctx.dev
-                .destroy_descriptor_set_layout(descriptor_set_layout, None);
-        }
-
         Ok(Kernel {
             cctx: &cctx,
             res_mgr: &res_mgr,
-            binding_nrs, 
+            binding_nrs,
             descriptor_types,
             pipeline,
+            pipeline_layout,
             descriptor_set,
+            descriptor_set_layout,
         })
     }
 }
@@ -239,6 +239,12 @@ impl<'a, 'b> Drop for Kernel<'a, 'b> {
         unsafe {
             self.cctx.dev.destroy_pipeline(self.pipeline, None);
             self.res_mgr.free_descriptor_set(self.descriptor_set);
+            self.cctx
+                .dev
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.cctx
+                .dev
+                .destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }

@@ -29,12 +29,12 @@ pub enum DispatcherError {
     Casting,
     #[error("Starting cmd buffer failed")]
     BeginningCommandBuffer,
-    #[error("Ending cmd buffer failed")]
-    EndingCommandBuffer,
+    #[error("Ending cmd buffer failed: {0}")]
+    EndingCommandBuffer(vk::Result),
     #[error("Getting compute queue of idx {0} from family idx {1} failed")]
     GettingComputeQueue(u32, u32),
-    #[error("Submitting to the compute queue failed")]
-    ComputeQueueSubmission,
+    #[error("Submitting to the compute queue failed: {0}")]
+    ComputeQueueSubmission(vk::Result),
     #[error("Count of streams does not match the count of compute queue")]
     StreamCntQueueCntMismatch,
     #[error("Not enough buffers for all streams")]
@@ -78,7 +78,6 @@ struct ComputeStream {
 pub struct Dispatcher<'a> {
     cctx: &'a ComputeContext,
     cmd_pool_permanent: vk::CommandPool,
-    max_stream_count: u32,
     comp_streams: Vec<ComputeStream>,
 }
 
@@ -136,7 +135,6 @@ impl<'a> Dispatcher<'a> {
         Ok(Dispatcher {
             cctx,
             cmd_pool_permanent,
-            max_stream_count,
             comp_streams,
         })
     }
@@ -144,9 +142,10 @@ impl<'a> Dispatcher<'a> {
     pub fn submit_upload(
         &mut self,
         dev_vars: &[DeviceVariable],
-        arg_vals: &[Box<dyn DeviceTransferable>],
+        host_vars: &[Box<dyn DeviceTransferable>],
         stream_nr: usize,
     ) -> Result<(), DispatcherError> {
+        /* Acquire Queue and Slot */
         let queue = self.comp_streams[stream_nr].comp_queue;
         let prev_submission_slot = self.get_current_submission_slot(stream_nr);
         let wait_semaphore = match unsafe {
@@ -170,6 +169,8 @@ impl<'a> Dispatcher<'a> {
             None => panic!("Somehow the stage vanished magically"),
         };
 
+        /* ----------------------------- */
+
         let total_mem_size = unsafe { self.cctx.dev.get_buffer_memory_requirements(stage.0).size };
         let mapped_mem = unsafe {
             self.cctx
@@ -179,16 +180,15 @@ impl<'a> Dispatcher<'a> {
         };
 
         /* Record */
-        let command_buffer_begin_info = vk::CommandBufferBeginInfo::default();
+        let cmd_buf_beg_info = vk::CommandBufferBeginInfo::default();
         unsafe {
             self.cctx
                 .dev
-                .begin_command_buffer(cmd_buf, &command_buffer_begin_info)
+                .begin_command_buffer(cmd_buf, &cmd_buf_beg_info)
         }
         .map_err(|_| DispatcherError::BeginningCommandBuffer)?;
         let mut offset: usize = 0;
-        let command_buffers = [cmd_buf];
-        for (val, dev_var) in arg_vals.iter().zip(dev_vars.iter()) {
+        for (val, dev_var) in host_vars.iter().zip(dev_vars.iter()) {
             val.cpy_to(mapped_mem, offset);
             let val_size = val.size();
             let copy_region = vk::BufferCopy::default()
@@ -203,37 +203,60 @@ impl<'a> Dispatcher<'a> {
             offset += val_size;
         }
         unsafe { self.cctx.dev.end_command_buffer(cmd_buf) }
-            .map_err(|_| DispatcherError::EndingCommandBuffer)?;
+            .map_err(|e| DispatcherError::EndingCommandBuffer(e))?;
 
         /* Submit */
-        let wait_semaphores = wait_semaphore.map_or(vec![], |s| vec![s]);
-        let signal_semaphores = [signal_semaphore];
+        let cmd_bufs = [cmd_buf];
+        let wait_sems = wait_semaphore.map_or(vec![], |s| vec![s]);
+        let signal_sems = [signal_semaphore];
+        let stage_flags = wait_sems
+            .iter()
+            .map(|_| vk::PipelineStageFlags::TOP_OF_PIPE)
+            .collect::<Vec<_>>();
         let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&command_buffers)
-            .wait_semaphores(&wait_semaphores)
-            .signal_semaphores(&signal_semaphores);
+            .command_buffers(&cmd_bufs)
+            .wait_semaphores(&wait_sems)
+            .wait_dst_stage_mask(&stage_flags)
+            .signal_semaphores(&signal_sems);
         unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
-            .map_err(|_| DispatcherError::ComputeQueueSubmission)?;
+            .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
 
         Ok(())
     }
 
     pub fn sync_stream(&self, stream_nr: usize) -> Result<(), DispatcherError> {
         let comp_queue = self.comp_streams[stream_nr].comp_queue;
-        unsafe { self.cctx.dev.queue_wait_idle(comp_queue) }.map_err(|e| DispatcherError::WaitingOnQueue(e))?;
+        unsafe { self.cctx.dev.queue_wait_idle(comp_queue) }
+            .map_err(|e| DispatcherError::WaitingOnQueue(e))?;
         Ok(())
     }
 
-    /*
     pub fn submit_launch(
-        &self,
+        &mut self,
         kernel: &Kernel,
         args: &[DeviceVariable],
-        subm_slot: (vk::CommandBuffer, vk::Fence),
-        compute_queue: vk::Queue,
+        stream_nr: usize,
+        launch_config: [u32; 3],
     ) -> Result<(), DispatcherError> {
-        let command_buffer = subm_slot.0;
-        let fence = subm_slot.1;
+        /* Acquire Queue and Slot */
+        let queue = self.comp_streams[stream_nr].comp_queue;
+        let prev_submission_slot = self.get_current_submission_slot(stream_nr);
+        let wait_semaphore = match unsafe {
+            self.cctx
+                .dev
+                .get_fence_status(prev_submission_slot.host_finish_sig)
+        } {
+            Ok(false) => Some(prev_submission_slot.device_finish_sig),
+            Ok(true) => None,
+            _ => return Err(DispatcherError::FenceStatus),
+        };
+
+        let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
+        let cmd_buf = subm_slot.cmd_buf;
+        let fence = subm_slot.host_finish_sig;
+        let signal_semaphore = subm_slot.device_finish_sig;
+
+        /* ---------------------------------- */
 
         let buffers = args
             .iter()
@@ -248,61 +271,147 @@ impl<'a> Dispatcher<'a> {
             &buffers,
         );
 
-        let compute_command_buffer_begin_info = vk::CommandBufferBeginInfo::default();
-        let submit_info = vk::SubmitInfo::default().command_buffers(&[subm_slot.0]);
+        /* ---------------------------------- */
+
+        let cmd_buf_beg_info = vk::CommandBufferBeginInfo::default();
         unsafe {
             self.cctx
                 .dev
-                .begin_command_buffer(compute_command_buffer, &compute_command_buffer_begin_info)
-                .map_err(|_| Error::GpuError("Begin compute command buffer failed.".into()))?;
-
-            vk_ctx.device.cmd_bind_pipeline(
-                vk_ctx.compute_command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                kernel
-                    .compute_pipeline
-                    .expect("No pipeline found for kernel"),
-            );
-            vk_ctx.device.cmd_bind_descriptor_sets(
-                vk_ctx.compute_command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                kernel
-                    .compute_pipeline_layout
-                    .expect("No pipeline layout found for kernel"),
-                0,
-                std::slice::from_ref(&kernel.descriptor_set),
-                &[],
-            );
-            vk_ctx.device.cmd_dispatch(
-                vk_ctx.compute_command_buffer,
-                group_x_count,
-                group_y_count,
-                1,
-            );
-
-            vk_ctx
-                .device
-                .end_command_buffer(vk_ctx.compute_command_buffer)
-                .map_err(|_| Error::GpuError("End compute command buffer failed.".into()))?;
-            vk_ctx
-                .device
-                .queue_submit(
-                    vk_ctx.compute_queue,
-                    std::slice::from_ref(&submit_info),
-                    vk::Fence::null(),
-                )
-                .map_err(|_| {
-                    Error::GpuError(
-                        "Memcpy from host to device failed: Cmd buffer submission failed.".into(),
-                    )
-                })?;
-            vk_ctx.device
-            .queue_wait_idle(vk_ctx.compute_queue)
-            .map_err(|_| { Error::GpuError("Memcpy from host to device failed: waiting on queue to become idle aborted unexpectedly.".into()) })?;
+                .begin_command_buffer(cmd_buf, &cmd_buf_beg_info)
         }
+        .map_err(|_| DispatcherError::BeginningCommandBuffer)?;
+
+        unsafe {
+            self.cctx.dev.cmd_bind_pipeline(
+                cmd_buf,
+                vk::PipelineBindPoint::COMPUTE,
+                kernel.pipeline,
+            )
+        };
+        unsafe {
+            self.cctx.dev.cmd_bind_descriptor_sets(
+                cmd_buf,
+                vk::PipelineBindPoint::COMPUTE,
+                kernel.pipeline_layout,
+                0,
+                &[kernel.descriptor_set],
+                &[],
+            )
+        };
+        unsafe {
+            self.cctx.dev.cmd_dispatch(
+                cmd_buf,
+                launch_config[0],
+                launch_config[1],
+                launch_config[2],
+            )
+        };
+        unsafe { self.cctx.dev.end_command_buffer(cmd_buf) }
+            .map_err(|e| DispatcherError::EndingCommandBuffer(e))?;
+
+        /* Submit */
+        let cmd_bufs = [cmd_buf];
+        let wait_sems = wait_semaphore.map_or(vec![], |s| vec![s]);
+        let signal_sems = [signal_semaphore];
+        let stage_flags = wait_sems
+            .iter()
+            .map(|_| vk::PipelineStageFlags::TOP_OF_PIPE)
+            .collect::<Vec<_>>();
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(&cmd_bufs)
+            .wait_semaphores(&wait_sems)
+            .wait_dst_stage_mask(&stage_flags)
+            .signal_semaphores(&signal_sems);
+        unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
+            .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
 
         Ok(())
-    }*/
+    }
+
+    fn submit_download(
+        &mut self,
+        dev_vars: &[DeviceVariable],
+        host_vars: &[Box<dyn DeviceTransferable>],
+        stream_nr: usize
+    ) -> Result<(), DispatcherError> {
+        /* Acquire Queue and Slot */
+        let queue = self.comp_streams[stream_nr].comp_queue;
+        let prev_submission_slot = self.get_current_submission_slot(stream_nr);
+        let wait_semaphore = match unsafe {
+            self.cctx
+                .dev
+                .get_fence_status(prev_submission_slot.host_finish_sig)
+        } {
+            Ok(false) => Some(prev_submission_slot.device_finish_sig),
+            Ok(true) => None,
+            _ => return Err(DispatcherError::FenceStatus),
+        };
+
+        let stage = create_stage(self.cctx, dev_vars)?;
+        let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
+        let cmd_buf = subm_slot.cmd_buf;
+        let fence = subm_slot.host_finish_sig;
+        let signal_semaphore = subm_slot.device_finish_sig;
+        subm_slot.stage = Some(stage);
+        let stage = match self.get_current_submission_slot(stream_nr).stage {
+            Some(stage) => stage,
+            None => panic!("Somehow the stage vanished magically"),
+        };
+
+        /* ----------------------------- */
+
+        let total_mem_size = unsafe { self.cctx.dev.get_buffer_memory_requirements(stage.0).size };
+        let mapped_mem = unsafe {
+            self.cctx
+                .dev
+                .map_memory(stage.1, 0, total_mem_size, vk::MemoryMapFlags::empty())
+                .map_err(|_| DispatcherError::MappingStagingMemory)?
+        };
+
+        /* Record */
+        let cmd_buf_beg_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            self.cctx
+                .dev
+                .begin_command_buffer(cmd_buf, &cmd_buf_beg_info)
+        }
+        .map_err(|_| DispatcherError::BeginningCommandBuffer)?;
+        let mut offset: usize = 0;
+        for (val, dev_var) in host_vars.iter().zip(dev_vars.iter()) {
+            val.cpy_to(mapped_mem, offset);
+            let val_size = val.size();
+            let copy_region = vk::BufferCopy::default()
+                .src_offset(offset.try_into().map_err(|_| DispatcherError::Casting)?)
+                .dst_offset(0)
+                .size(val_size.try_into().map_err(|_| DispatcherError::Casting)?);
+            unsafe {
+                self.cctx
+                    .dev
+                    .cmd_copy_buffer(cmd_buf, stage.0, dev_var.buffer, &[copy_region]);
+            }
+            offset += val_size;
+        }
+        unsafe { self.cctx.dev.end_command_buffer(cmd_buf) }
+            .map_err(|e| DispatcherError::EndingCommandBuffer(e))?;
+
+        /* Submit */
+        let cmd_bufs = [cmd_buf];
+        let wait_sems = wait_semaphore.map_or(vec![], |s| vec![s]);
+        let signal_sems = [signal_semaphore];
+        let stage_flags = wait_sems
+            .iter()
+            .map(|_| vk::PipelineStageFlags::TOP_OF_PIPE)
+            .collect::<Vec<_>>();
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(&cmd_bufs)
+            .wait_semaphores(&wait_sems)
+            .wait_dst_stage_mask(&stage_flags)
+            .signal_semaphores(&signal_sems);
+        unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
+            .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
+
+        Ok(())
+    }
 
     fn destroy_stage(&self, stage: (vk::Buffer, vk::DeviceMemory)) {
         unsafe { self.cctx.dev.unmap_memory(stage.1) };
@@ -332,17 +441,14 @@ impl<'a> Dispatcher<'a> {
         if let Some(stage) = subm_slot.stage {
             self.destroy_stage(stage);
         }
-        unsafe {
-            self.cctx
-                .dev
-                .reset_fences(&[subm_slot.host_finish_sig])
-        }
-        .map_err(|_| DispatcherError::ResettingFence)?;
+        unsafe { self.cctx.dev.reset_fences(&[subm_slot.host_finish_sig]) }
+            .map_err(|_| DispatcherError::ResettingFence)?;
         unsafe {
             self.cctx
                 .dev
                 .reset_command_buffer(subm_slot.cmd_buf, vk::CommandBufferResetFlags::empty())
-        }.map_err(|e| DispatcherError::ResettingCommandBuffer(e))?;
+        }
+        .map_err(|e| DispatcherError::ResettingCommandBuffer(e))?;
 
         let stream = &mut self.comp_streams[stream_nr];
         let subm_slot = &mut stream.submission_slots[stream.next_submission_slot_index];
@@ -363,6 +469,13 @@ impl<'a> Drop for Dispatcher<'a> {
                         .dev
                         .free_command_buffers(self.cmd_pool_permanent, &[subm_slot.cmd_buf]);
                     self.cctx.dev.destroy_fence(subm_slot.host_finish_sig, None);
+                    self.cctx
+                        .dev
+                        .destroy_semaphore(subm_slot.device_finish_sig, None);
+                    if let Some((buffer, memory)) = subm_slot.stage {
+                        self.cctx.dev.free_memory(memory, None);
+                        self.cctx.dev.destroy_buffer(buffer, None)
+                    }
                 }
             }
         }
