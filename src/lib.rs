@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn smoke_submit_launch() {
+    fn smoke_full_loop() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
         let res_mgr =
             KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
@@ -426,11 +426,10 @@ mod tests {
             .expect("launch submission failed");
 
         uint_data[0] = 0;
-        float_data[0] = 0.0;
         let host_variables: &mut [&mut dyn DeviceTransferable] =
             &mut [&mut uint_data, &mut float_data];
         dispatcher
-            .submit_download(&variables, host_variables, 0)
+            .download_sync(&variables, host_variables, 0)
             .expect("upload submission failed");
 
         //dispatcher
@@ -439,5 +438,79 @@ mod tests {
 
         assert_eq!(uint_data[0], 3);
         assert_eq!(float_data, [2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn two_kernels() {
+        let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
+        let res_mgr =
+            KernelResourceManager::new(&cctx, 10).expect("Resource Manager creation failed");
+        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let mut shader = Vec::<u32>::new();
+        for bytes in shader_bytes.chunks_exact(4) {
+            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let mut float_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
+        let arg_infos = vec![
+            KernelArgInfo {
+                is_uniformly_readonly: true,
+                size: std::mem::size_of::<u32> as u64,
+            },
+            KernelArgInfo {
+                is_uniformly_readonly: false,
+                size: (std::mem::size_of::<f32>() * float_data.len())
+                    .try_into()
+                    .expect("Cast from usize to u64 not possible"),
+            },
+        ];
+        let kernel_1 = Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone())
+            .expect("Kernel creation failed");
+        let kernel_2 = Kernel::new(&cctx, &res_mgr, &shader, arg_infos.clone())
+            .expect("Kernel creation failed");
+
+        let len = DeviceVariable::builder()
+            .host_to_dev_transf(true)
+            .dev_to_host_transf(true)
+            .is_uniformly_read(true)
+            .size(std::mem::size_of::<u32>() as u64)
+            .build(&cctx)
+            .expect("build len device variable failed");
+        let float_array = DeviceVariable::builder()
+            .host_to_dev_transf(true)
+            .dev_to_host_transf(true)
+            .is_uniformly_read(false)
+            .size((float_data.len() * std::mem::size_of::<f32>()) as u64)
+            .build(&cctx)
+            .expect("building device variable failed");
+
+        let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+        let variables = [len, float_array];
+        let host_variables: &[&dyn DeviceTransferable] = &[&uint_data, &float_data];
+
+        dispatcher
+            .submit_upload(&variables, host_variables, 0)
+            .expect("upload submission failed");
+
+        dispatcher
+            .submit_launch(&kernel_1, &variables, 0, [1, 1, 1])
+            .expect("launch submission failed");
+        dispatcher
+            .submit_launch(&kernel_2, &variables, 0, [1, 1, 1])
+            .expect("launch submission failed");
+
+        uint_data[0] = 0;
+        let host_variables: &mut [&mut dyn DeviceTransferable] =
+            &mut [&mut uint_data, &mut float_data];
+        dispatcher
+            .download_sync(&variables, host_variables, 0)
+            .expect("upload submission failed");
+
+        //dispatcher
+        //    .sync_stream(0)
+        //    .expect("Waiting on stream to finish its work has been cancelled unexpectedly");
+
+        assert_eq!(uint_data[0], 3);
+        assert_eq!(float_data, [3.0, 4.0, 5.0]);
     }
 }
