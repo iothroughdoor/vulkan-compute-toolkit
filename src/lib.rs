@@ -331,7 +331,7 @@ mod tests {
         for bytes in shader_bytes.chunks_exact(4) {
             shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
-        let float_data = vec![1.0, 2.0, 3.0];
+        let float_data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
         let arg_infos = vec![
             KernelArgInfo {
@@ -363,14 +363,7 @@ mod tests {
         let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
         let variables = [len, float_array];
         dispatcher
-            .submit_upload(
-                &variables,
-                &[
-                    Box::<Vec<u32>>::new(uint_data),
-                    Box::<Vec<f32>>::new(float_data),
-                ],
-                0,
-            )
+            .submit_upload(&variables, &[&uint_data, &float_data], 0)
             .expect("upload submission failed");
 
         dispatcher
@@ -388,8 +381,8 @@ mod tests {
         for bytes in shader_bytes.chunks_exact(4) {
             shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
-        let float_data = vec![1.0, 2.0, 3.0];
-        let uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
+        let mut float_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
         let arg_infos = vec![
             KernelArgInfo {
                 is_uniformly_readonly: true,
@@ -407,12 +400,14 @@ mod tests {
 
         let len = DeviceVariable::builder()
             .host_to_dev_transf(true)
+            .dev_to_host_transf(true)
             .is_uniformly_read(true)
             .size(std::mem::size_of::<u32>() as u64)
             .build(&cctx)
             .expect("build len device variable failed");
         let float_array = DeviceVariable::builder()
             .host_to_dev_transf(true)
+            .dev_to_host_transf(true)
             .is_uniformly_read(false)
             .size((float_data.len() * std::mem::size_of::<f32>()) as u64)
             .build(&cctx)
@@ -420,23 +415,29 @@ mod tests {
 
         let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
         let variables = [len, float_array];
+        let host_variables: &[&dyn DeviceTransferable] = &[&uint_data, &float_data];
+
         dispatcher
-            .submit_upload(
-                &variables,
-                &[
-                    Box::<Vec<u32>>::new(uint_data),
-                    Box::<Vec<f32>>::new(float_data),
-                ],
-                0,
-            )
+            .submit_upload(&variables, host_variables, 0)
             .expect("upload submission failed");
 
         dispatcher
-            .submit_launch(&kernel, &variables, 0, [3, 0, 0])
+            .submit_launch(&kernel, &variables, 0, [1, 1, 1])
             .expect("launch submission failed");
 
+        uint_data[0] = 0;
+        float_data[0] = 0.0;
+        let host_variables: &mut [&mut dyn DeviceTransferable] =
+            &mut [&mut uint_data, &mut float_data];
         dispatcher
-            .sync_stream(0)
-            .expect("Waiting on stream to finish its work has been cancelled unexpectedly");
+            .submit_download(&variables, host_variables, 0)
+            .expect("upload submission failed");
+
+        //dispatcher
+        //    .sync_stream(0)
+        //    .expect("Waiting on stream to finish its work has been cancelled unexpectedly");
+
+        assert_eq!(uint_data[0], 3);
+        assert_eq!(float_data, [2.0, 3.0, 4.0]);
     }
 }

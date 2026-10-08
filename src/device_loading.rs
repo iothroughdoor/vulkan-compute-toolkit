@@ -142,22 +142,12 @@ impl<'a> Dispatcher<'a> {
     pub fn submit_upload(
         &mut self,
         dev_vars: &[DeviceVariable],
-        host_vars: &[Box<dyn DeviceTransferable>],
+        host_vars: &[&dyn DeviceTransferable],
         stream_nr: usize,
     ) -> Result<(), DispatcherError> {
         /* Acquire Queue and Slot */
         let queue = self.comp_streams[stream_nr].comp_queue;
-        let prev_submission_slot = self.get_current_submission_slot(stream_nr);
-        let wait_semaphore = match unsafe {
-            self.cctx
-                .dev
-                .get_fence_status(prev_submission_slot.host_finish_sig)
-        } {
-            Ok(false) => Some(prev_submission_slot.device_finish_sig),
-            Ok(true) => None,
-            _ => return Err(DispatcherError::FenceStatus),
-        };
-
+        let wait_semaphore = self.get_wait_semaphore(stream_nr)?;
         let stage = create_stage(self.cctx, dev_vars)?;
         let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
         let cmd_buf = subm_slot.cmd_buf;
@@ -171,7 +161,7 @@ impl<'a> Dispatcher<'a> {
 
         /* ----------------------------- */
 
-        let total_mem_size = unsafe { self.cctx.dev.get_buffer_memory_requirements(stage.0).size };
+        let total_mem_size = host_vars.iter().map(|hv| hv.size() as u64).sum();
         let mapped_mem = unsafe {
             self.cctx
                 .dev
@@ -231,6 +221,18 @@ impl<'a> Dispatcher<'a> {
         Ok(())
     }
 
+    fn get_wait_semaphore(
+        &self,
+        stream_nr: usize,
+    ) -> Result<Option<vk::Semaphore>, DispatcherError> {
+        let subm_slot = self.get_current_submission_slot(stream_nr);
+        match unsafe { self.cctx.dev.get_fence_status(subm_slot.host_finish_sig) } {
+            Ok(false) => Ok(Some(subm_slot.device_finish_sig)),
+            Ok(true) => Ok(None),
+            _ => return Err(DispatcherError::FenceStatus),
+        }
+    }
+
     pub fn submit_launch(
         &mut self,
         kernel: &Kernel,
@@ -238,25 +240,12 @@ impl<'a> Dispatcher<'a> {
         stream_nr: usize,
         launch_config: [u32; 3],
     ) -> Result<(), DispatcherError> {
-        /* Acquire Queue and Slot */
         let queue = self.comp_streams[stream_nr].comp_queue;
-        let prev_submission_slot = self.get_current_submission_slot(stream_nr);
-        let wait_semaphore = match unsafe {
-            self.cctx
-                .dev
-                .get_fence_status(prev_submission_slot.host_finish_sig)
-        } {
-            Ok(false) => Some(prev_submission_slot.device_finish_sig),
-            Ok(true) => None,
-            _ => return Err(DispatcherError::FenceStatus),
-        };
-
+        let wait_semaphore = self.get_wait_semaphore(stream_nr)?;
         let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
         let cmd_buf = subm_slot.cmd_buf;
         let fence = subm_slot.host_finish_sig;
         let signal_semaphore = subm_slot.device_finish_sig;
-
-        /* ---------------------------------- */
 
         let buffers = args
             .iter()
@@ -328,25 +317,14 @@ impl<'a> Dispatcher<'a> {
         Ok(())
     }
 
-    fn submit_download(
+    pub fn submit_download(
         &mut self,
         dev_vars: &[DeviceVariable],
-        host_vars: &[Box<dyn DeviceTransferable>],
-        stream_nr: usize
+        host_vars: &mut [&mut dyn DeviceTransferable],
+        stream_nr: usize,
     ) -> Result<(), DispatcherError> {
-        /* Acquire Queue and Slot */
         let queue = self.comp_streams[stream_nr].comp_queue;
-        let prev_submission_slot = self.get_current_submission_slot(stream_nr);
-        let wait_semaphore = match unsafe {
-            self.cctx
-                .dev
-                .get_fence_status(prev_submission_slot.host_finish_sig)
-        } {
-            Ok(false) => Some(prev_submission_slot.device_finish_sig),
-            Ok(true) => None,
-            _ => return Err(DispatcherError::FenceStatus),
-        };
-
+        let wait_semaphore = self.get_wait_semaphore(stream_nr)?;
         let stage = create_stage(self.cctx, dev_vars)?;
         let subm_slot = self.acquire_next_submission_slot(stream_nr)?;
         let cmd_buf = subm_slot.cmd_buf;
@@ -358,9 +336,7 @@ impl<'a> Dispatcher<'a> {
             None => panic!("Somehow the stage vanished magically"),
         };
 
-        /* ----------------------------- */
-
-        let total_mem_size = unsafe { self.cctx.dev.get_buffer_memory_requirements(stage.0).size };
+        let total_mem_size = host_vars.iter().map(|hv| hv.size() as u64).sum();
         let mapped_mem = unsafe {
             self.cctx
                 .dev
@@ -377,17 +353,16 @@ impl<'a> Dispatcher<'a> {
         }
         .map_err(|_| DispatcherError::BeginningCommandBuffer)?;
         let mut offset: usize = 0;
-        for (val, dev_var) in host_vars.iter().zip(dev_vars.iter()) {
-            val.cpy_to(mapped_mem, offset);
+        for (val, dev_var) in host_vars.iter_mut().zip(dev_vars.iter()) {
             let val_size = val.size();
             let copy_region = vk::BufferCopy::default()
-                .src_offset(offset.try_into().map_err(|_| DispatcherError::Casting)?)
-                .dst_offset(0)
+                .src_offset(0)
+                .dst_offset(offset.try_into().map_err(|_| DispatcherError::Casting)?)
                 .size(val_size.try_into().map_err(|_| DispatcherError::Casting)?);
             unsafe {
                 self.cctx
                     .dev
-                    .cmd_copy_buffer(cmd_buf, stage.0, dev_var.buffer, &[copy_region]);
+                    .cmd_copy_buffer(cmd_buf, dev_var.buffer, stage.0, &[copy_region]);
             }
             offset += val_size;
         }
@@ -409,6 +384,15 @@ impl<'a> Dispatcher<'a> {
             .signal_semaphores(&signal_sems);
         unsafe { self.cctx.dev.queue_submit(queue, &[submit_info], fence) }
             .map_err(|e| DispatcherError::ComputeQueueSubmission(e))?;
+
+        unsafe { self.cctx.dev.wait_for_fences(&[fence], true, u64::MAX) }.unwrap();
+
+        offset = 0;
+        for val in host_vars.iter_mut() {
+            let val_size = val.size();
+            val.cpy_from(mapped_mem, offset);
+            offset += val_size;
+        }
 
         Ok(())
     }
