@@ -2,9 +2,6 @@ use std::process::Command;
 use std::fs;
 
 fn main() {
-    //println!("cargo:rerun-if-changed=src/shader/add_one.glsl");
-    //println!("cargo:rerun-if-changed=src/shader/sum_array.glsl");
-
     match fs::create_dir_all("data/shader") {
         Err(e) => {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -16,6 +13,7 @@ fn main() {
 
     glsl_compile("src/shader/add_one.glsl", "data/shader/add_one.spv");
     glsl_compile("src/shader/sum_array.glsl", "data/shader/sum_array.spv");
+    glsl_compile("src/shader/printing_shader.glsl", "data/shader/printing_shader.spv");
 }
 
 fn glsl_compile(input_path: &str, output_path: &str) {

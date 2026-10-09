@@ -1,11 +1,11 @@
 use include_bytes_plus::include_bytes;
 use vulkan_computing_toolkit as vctk;
 
-const N: u32 = 4096;
-const LOCAL_SIZE: u32 = 1024;
-
 #[test]
 fn test_sum_array_shader() {
+    const N: u32 = 4096;
+    const LOCAL_SIZE: u32 = 1024;
+
     let nats: Vec<i32> = (0..(N as i32)).collect();
     let len: Vec<u32> = vec![N];
     let mut sum: Vec<i32> = vec![0];
@@ -34,8 +34,7 @@ fn test_sum_array_shader() {
         .local_size_x(LOCAL_SIZE)
         .build();
 
-    let ker = vctk::Kernel::new(&cctx, &shader, ker_args.clone())
-        .expect("Kernel creation failed");
+    let ker = vctk::Kernel::new(&cctx, &shader, ker_args.clone()).expect("Kernel creation failed");
 
     let dev_len = vctk::DeviceVariable::builder()
         .is_uniformly_read(true)
@@ -72,4 +71,30 @@ fn test_sum_array_shader() {
         .expect("Downloading failed");
 
     assert_eq!(sum[0], nats.iter().sum::<i32>());
+}
+
+#[test]
+fn test_printing_shader() {
+    let cctx =
+        vctk::ComputeContext::new("Smoke Test", 0).expect("Creating the compute context failed");
+
+    let ker_args = vec![];
+
+    let spirv_code = include_bytes!("data/shader/printing_shader.spv" as u32);
+    let shader = vctk::ComputeShader::builder()
+        .spirv(spirv_code.into())
+        .local_size_x(2)
+        .build();
+
+    let ker = vctk::Kernel::new(&cctx, &shader, ker_args.clone()).expect("Kernel creation failed");
+
+    let mut dispatcher = vctk::Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+
+    dispatcher
+        .launch_async(&ker, &[], 0, [1, 1, 1])
+        .expect("Launching kernel failed");
+
+    dispatcher
+        .sync_stream(0)
+        .expect("Sync failed");
 }

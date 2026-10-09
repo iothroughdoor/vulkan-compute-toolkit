@@ -185,7 +185,7 @@ impl ComputeContext {
             vk::SpecializationMapEntry {
                 constant_id: 0,
                 offset: 0,
-                size: 4, 
+                size: 4,
             },
             vk::SpecializationMapEntry {
                 constant_id: 1,
@@ -240,6 +240,11 @@ fn create_vk_instance(app_name: &CStr, app_version: u32) -> Result<Instance, Err
         .map(|name| name.as_ptr())
         .collect();
 
+    let validation_feature_enables: Vec<vk::ValidationFeatureEnableEXT> =
+        vec![vk::ValidationFeatureEnableEXT::DEBUG_PRINTF];
+    let mut validation_features = vk::ValidationFeaturesEXT::default()
+        .enabled_validation_features(&validation_feature_enables);
+
     let app_info = vk::ApplicationInfo::default()
         .application_name(app_name)
         .application_version(app_version)
@@ -249,7 +254,8 @@ fn create_vk_instance(app_name: &CStr, app_version: u32) -> Result<Instance, Err
 
     let create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
-        .enabled_layer_names(&layer_names);
+        .enabled_layer_names(&layer_names)
+        .push_next(&mut validation_features);
 
     let entry = Entry::linked();
     unsafe {
