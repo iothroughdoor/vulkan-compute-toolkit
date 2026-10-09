@@ -7,6 +7,7 @@ edition = "2024"
 ash = {version = "0.38.*", default-features = false, features = ["linked"]}
 thiserror = {version = "2.*"}
 include-bytes-plus = {version = "*"}
+serial_test = {version = "3.*"}
 
 [[test]]
 name = "shader_tests"

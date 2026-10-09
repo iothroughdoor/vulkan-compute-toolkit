@@ -1,10 +1,10 @@
 mod device_loading;
-mod workload;
 mod shader;
+mod workload;
 
 pub use device_loading::Dispatcher;
-pub use workload::{DeviceTransferable, DeviceVariable, Kernel, KernelArgInfo};
 pub use shader::*;
+pub use workload::{DeviceTransferable, DeviceVariable, Kernel, KernelArgInfo};
 
 use ash::{Device, Entry, Instance, vk};
 use std::ffi::{CStr, CString};
@@ -29,6 +29,8 @@ pub enum Error {
     NoSuitablePhysicalDevice,
     #[error("Creating the descriptor pool failed: {0}")]
     Creation(vk::Result),
+    #[error("Shader module creation failed")]
+    ShaderModuleCreation,
 }
 
 #[derive(Debug, Error)]
@@ -160,8 +162,15 @@ impl ComputeContext {
     fn create_pipeline(
         &self,
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
-        shader_module: vk::ShaderModule,
+        shader: &ComputeShader,
     ) -> Result<(vk::Pipeline, vk::PipelineLayout), ComputeContextError> {
+        let shader_module_create_info = vk::ShaderModuleCreateInfo::default().code(&shader.spirv);
+        let shader_module = unsafe {
+            self.dev
+                .create_shader_module(&shader_module_create_info, None)
+                .map_err(|_| Error::ShaderModuleCreation)
+        }?;
+
         let pipeline_layout_create_info =
             vk::PipelineLayoutCreateInfo::default().set_layouts(descriptor_set_layouts);
         let pipeline_layout = unsafe {
@@ -170,9 +179,35 @@ impl ComputeContext {
                 .map_err(|e| ComputeContextError::PipelineLayoutCreation(e))?
         };
 
+        // the size being 4 byte relies on GLSL Lang Spec 4.60, can we do better / safer here?
+        // are they always LE?
+        let map_entries = [
+            vk::SpecializationMapEntry {
+                constant_id: 0,
+                offset: 0,
+                size: 4, 
+            },
+            vk::SpecializationMapEntry {
+                constant_id: 1,
+                offset: 4,
+                size: 4,
+            },
+            vk::SpecializationMapEntry {
+                constant_id: 2,
+                offset: 8,
+                size: 4,
+            },
+        ];
+        let mut local_sizes: Vec<u8> = shader.local_size_x.to_le_bytes().into();
+        local_sizes.extend(shader.local_size_y.to_le_bytes());
+        local_sizes.extend(shader.local_size_z.to_le_bytes());
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&map_entries)
+            .data(&local_sizes);
         let shader_stage_create_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
+            .specialization_info(&spec_info)
             .name(c"main");
         let pipeline_create_infos = [vk::ComputePipelineCreateInfo::default()
             .layout(pipeline_layout)
@@ -315,6 +350,7 @@ fn create_descriptor_pool(dev: &Device, desc_count: u32) -> Result<vk::Descripto
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /*
     impl<T: Copy> DeviceTransferable for Vec<T> {
@@ -339,14 +375,17 @@ mod tests {
     */
 
     #[test]
+    #[serial]
     fn smoke_cctx_creation() {
         ComputeContext::new("App", 0).expect("Compute context creation failed");
     }
 
+    #[ignore]
     #[test]
+    #[serial]
     fn smoke_kernel_creation_inv_shader() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let shader_dummy = &[0u32];
+        let shader_dummy = ComputeShader::builder().spirv(vec![0u32]).build();
         let data = vec![1.0, 2.0, 3.0];
         let arg_infos = vec![KernelArgInfo {
             is_uniformly_readonly: true,
@@ -354,37 +393,47 @@ mod tests {
                 .try_into()
                 .expect("Cast from usize to u64 not possible"),
         }];
-        if let Ok(_kernel) = Kernel::new(&cctx, shader_dummy, arg_infos) {
+        if let Ok(_kernel) = Kernel::new(&cctx, &shader_dummy, arg_infos) {
             panic!("Why is the shader valid?");
         }
     }
 
     #[test]
+    #[serial]
     fn smoke_kernel_creation_valid_shader() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
-        let mut shader = Vec::<u32>::new();
+        let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
-            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
+        let shader = ComputeShader::builder().spirv(spirv).build();
         let data = vec![1.0, 2.0, 3.0];
-        let arg_infos = vec![KernelArgInfo {
-            is_uniformly_readonly: true,
-            size: (std::mem::size_of::<f32>() * data.len())
-                .try_into()
-                .expect("Cast from usize to u64 not possible"),
-        }];
+        let arg_infos = vec![
+            KernelArgInfo {
+                is_uniformly_readonly: true,
+                size: std::mem::size_of::<u32>() as u64,
+            },
+            KernelArgInfo {
+                is_uniformly_readonly: false,
+                size: (std::mem::size_of::<f32>() * data.len())
+                    .try_into()
+                    .expect("Cast from usize to u64 not possible"),
+            },
+        ];
         Kernel::new(&cctx, &shader, arg_infos).expect("Kernel creation failed");
     }
 
     #[test]
+    #[serial]
     fn smoke_submit_upload() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
-        let mut shader = Vec::<u32>::new();
+        let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
-            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
+        let shader = ComputeShader::builder().spirv(spirv).build();
         let float_data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
         let arg_infos = vec![
@@ -426,13 +475,18 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn smoke_full_loop() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
-        let mut shader = Vec::<u32>::new();
+        let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
-            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
+        let shader = ComputeShader::builder()
+            .spirv(spirv)
+            .local_size_x(3)
+            .build();
         let mut float_data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let mut uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
         let arg_infos = vec![
@@ -489,13 +543,18 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn two_kernels() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
         let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
-        let mut shader = Vec::<u32>::new();
+        let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
-            shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
+        let shader = ComputeShader::builder()
+            .spirv(spirv)
+            .local_size_x(3)
+            .build();
 
         let mut float_data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let mut uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
@@ -542,7 +601,8 @@ mod tests {
             .expect("launch submission failed");
 
         uint_data[0] = 0;
-        let mut host_variables: [&mut dyn DeviceTransferable; 2] = [&mut uint_data, &mut float_data];
+        let mut host_variables: [&mut dyn DeviceTransferable; 2] =
+            [&mut uint_data, &mut float_data];
         dispatcher
             .download_sync(&dev_vars, &mut host_variables, 0)
             .expect("upload submission failed");

@@ -1,3 +1,4 @@
+use include_bytes_plus::include_bytes;
 use vulkan_computing_toolkit as vctk;
 
 const N: u32 = 4096;
@@ -27,7 +28,13 @@ fn test_sum_array_shader() {
         },
     ];
 
-    let ker = vctk::Kernel::new(&cctx, vctk::SUM_ARRAY_SHADER_SPV, ker_args.clone())
+    let spirv_code = include_bytes!("data/shader/sum_array.spv" as u32);
+    let shader = vctk::ComputeShader::builder()
+        .spirv(spirv_code.into())
+        .local_size_x(LOCAL_SIZE)
+        .build();
+
+    let ker = vctk::Kernel::new(&cctx, &shader, ker_args.clone())
         .expect("Kernel creation failed");
 
     let dev_len = vctk::DeviceVariable::builder()

@@ -4,7 +4,8 @@
 #pragma shader_stage(compute)
 #extension GL_KHR_shader_subgroup_shuffle_relative : enable
 
-layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+// layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 layout(binding = 0) uniform UBO {
     uint len;
@@ -23,6 +24,8 @@ void main()
     // load into shared mem
     scratch_array[gl_LocalInvocationIndex] = vec[gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationIndex];
 
+    barrier();
+
     // reduction tree
     int val = 0;
     for (uint delta = gl_SubgroupSize/2; delta > 0; delta /= 2) {
@@ -30,7 +33,7 @@ void main()
         scratch_array[gl_LocalInvocationIndex] += subgroupShuffleDown(val, delta);
     }
 
-    memoryBarrierShared();
+    barrier();
 
     // first subgroup collects
     if (gl_LocalInvocationIndex < gl_SubgroupSize && gl_LocalInvocationIndex > 0) {
@@ -39,7 +42,7 @@ void main()
         }
     }
 
-    memoryBarrierShared();
+    barrier();
 
     if (gl_LocalInvocationIndex < gl_SubgroupSize) {
         for (uint delta = gl_WorkGroupSize.x / gl_SubgroupSize / 2; delta > 0; delta /= 2) {
@@ -48,7 +51,7 @@ void main()
         }
     }
 
-    memoryBarrierShared();
+    barrier();
 
     // leader writes back
     if (gl_LocalInvocationIndex == 0) {

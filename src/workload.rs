@@ -1,4 +1,4 @@
-use crate::{ComputeContext, ComputeContextError, find_memory_type_index};
+use crate::{ComputeContext, ComputeContextError, find_memory_type_index, shader::ComputeShader};
 use ash::vk;
 use thiserror::Error;
 
@@ -156,8 +156,6 @@ pub enum KernelError {
     ComputeContext(#[from] ComputeContextError),
     #[error("Pipeline creation failed")]
     PipelineCreation,
-    #[error("Shader module creation failed")]
-    ShaderModuleCreation,
     #[error("Descriptor set layout creation failed")]
     DescriptorSetLayoutCreation,
     #[error("Pipeline layout creation failed")]
@@ -188,7 +186,8 @@ pub struct KernelArgInfo {
 impl<'a> Kernel<'a> {
     pub fn new(
         cctx: &'a ComputeContext,
-        shader_spirv: &[u32],
+        //shader_spirv: &[u32],
+        shader: &ComputeShader,
         arg_infos: Vec<KernelArgInfo>,
     ) -> Result<Self, KernelError> {
         let binding_nrs = arg_infos
@@ -207,16 +206,10 @@ impl<'a> Kernel<'a> {
             })
             .collect::<Vec<vk::DescriptorType>>();
 
-        let shader_module_create_info = vk::ShaderModuleCreateInfo::default().code(shader_spirv);
-        let shader_module = unsafe {
-            cctx.dev
-                .create_shader_module(&shader_module_create_info, None)
-                .map_err(|_| KernelError::ShaderModuleCreation)
-        }?;
         let descriptor_set_layout =
             cctx.create_descriptor_set_layout(&binding_nrs, &descriptor_types)?;
         let (pipeline, pipeline_layout) =
-            cctx.create_pipeline(&[descriptor_set_layout], shader_module)?;
+            cctx.create_pipeline(&[descriptor_set_layout], shader)?;
 
         let descriptor_set = cctx.allocate_descriptor_set(descriptor_set_layout)?;
 
