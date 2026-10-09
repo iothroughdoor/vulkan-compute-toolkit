@@ -1,10 +1,10 @@
 mod device_loading;
 mod workload;
+mod shader;
 
 pub use device_loading::Dispatcher;
-pub use workload::{
-    DeviceTransferable, DeviceVariable, Kernel, KernelArgInfo,
-};
+pub use workload::{DeviceTransferable, DeviceVariable, Kernel, KernelArgInfo};
+pub use shader::*;
 
 use ash::{Device, Entry, Instance, vk};
 use std::ffi::{CStr, CString};
@@ -316,6 +316,7 @@ fn create_descriptor_pool(dev: &Device, desc_count: u32) -> Result<vk::Descripto
 mod tests {
     use super::*;
 
+    /*
     impl<T: Copy> DeviceTransferable for Vec<T> {
         fn cpy_to(&self, ptr: *mut std::ffi::c_void, offset: usize) {
             let mem_typed = unsafe {
@@ -335,6 +336,7 @@ mod tests {
             std::mem::size_of::<T>() * self.len()
         }
     }
+    */
 
     #[test]
     fn smoke_cctx_creation() {
@@ -445,8 +447,8 @@ mod tests {
                     .expect("Cast from usize to u64 not possible"),
             },
         ];
-        let kernel = Kernel::new(&cctx, &shader, arg_infos.clone())
-            .expect("Kernel creation failed");
+        let kernel =
+            Kernel::new(&cctx, &shader, arg_infos.clone()).expect("Kernel creation failed");
 
         let len = DeviceVariable::builder()
             .host_to_dev_transf(true)
@@ -494,12 +496,13 @@ mod tests {
         for bytes in shader_bytes.chunks_exact(4) {
             shader.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
+
         let mut float_data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let mut uint_data: Vec<u32> = vec![float_data.len().try_into().expect("too large for u32")];
         let arg_infos = vec![
             KernelArgInfo {
                 is_uniformly_readonly: true,
-                size: std::mem::size_of::<u32> as u64,
+                size: std::mem::size_of::<u32>() as u64,
             },
             KernelArgInfo {
                 is_uniformly_readonly: false,
@@ -508,46 +511,40 @@ mod tests {
                     .expect("Cast from usize to u64 not possible"),
             },
         ];
-        let kernel_1 = Kernel::new(&cctx, &shader, arg_infos.clone())
-            .expect("Kernel creation failed");
-        let kernel_2 = Kernel::new(&cctx, &shader, arg_infos.clone())
-            .expect("Kernel creation failed");
+        let kernel_1 =
+            Kernel::new(&cctx, &shader, arg_infos.clone()).expect("Kernel creation failed");
+        let kernel_2 =
+            Kernel::new(&cctx, &shader, arg_infos.clone()).expect("Kernel creation failed");
 
         let len = DeviceVariable::builder()
-            .host_to_dev_transf(true)
-            .dev_to_host_transf(true)
+            .size(arg_infos[0].size)
             .is_uniformly_read(true)
-            .size(std::mem::size_of::<u32>() as u64)
             .build(&cctx)
             .expect("build len device variable failed");
         let float_array = DeviceVariable::builder()
-            .host_to_dev_transf(true)
-            .dev_to_host_transf(true)
-            .is_uniformly_read(false)
-            .size((float_data.len() * std::mem::size_of::<f32>()) as u64)
+            .size(arg_infos[1].size)
             .build(&cctx)
-            .expect("building device variable failed");
+            .expect("building float_array device variable failed");
 
+        let dev_vars = [len, float_array];
+        let host_vars: [&dyn DeviceTransferable; 2] = [&uint_data, &float_data];
         let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
-        let variables = [len, float_array];
-        let host_variables: &[&dyn DeviceTransferable] = &[&uint_data, &float_data];
 
         dispatcher
-            .upload_async(&variables, host_variables, 0)
+            .upload_async(&dev_vars, &host_vars, 0)
             .expect("upload submission failed");
 
         dispatcher
-            .launch_async(&kernel_1, &variables, 0, [1, 1, 1])
+            .launch_async(&kernel_1, &dev_vars, 0, [1, 1, 1])
             .expect("launch submission failed");
         dispatcher
-            .launch_async(&kernel_2, &variables, 0, [1, 1, 1])
+            .launch_async(&kernel_2, &dev_vars, 0, [1, 1, 1])
             .expect("launch submission failed");
 
         uint_data[0] = 0;
-        let host_variables: &mut [&mut dyn DeviceTransferable] =
-            &mut [&mut uint_data, &mut float_data];
+        let mut host_variables: [&mut dyn DeviceTransferable; 2] = [&mut uint_data, &mut float_data];
         dispatcher
-            .download_sync(&variables, host_variables, 0)
+            .download_sync(&dev_vars, &mut host_variables, 0)
             .expect("upload submission failed");
 
         assert_eq!(uint_data[0], 3);

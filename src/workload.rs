@@ -4,8 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DeviceVariableError {
-    #[error("Creation of buffer failed")]
-    BufferCreation,
+    #[error("Creation of buffer failed: {0}")]
+    BufferCreation(vk::Result),
     #[error(
         "Requirements of buffer on memory is incompatible with the memory types the device offers"
     )]
@@ -37,13 +37,24 @@ impl<'a> Drop for DeviceVariable<'a> {
     }
 }
 
-#[derive(Default)]
 pub struct DeviceVariableBuilder {
     size_: u64,
     host_to_dev_transf_: bool,
     dev_to_host_transf_: bool,
     is_uniformly_readonly_: bool,
     use_host_caching_: bool,
+}
+
+impl Default for DeviceVariableBuilder {
+    fn default() -> Self {
+        DeviceVariableBuilder{
+            size_: 0,
+            host_to_dev_transf_: true,
+            dev_to_host_transf_: true,
+            is_uniformly_readonly_: false,
+            use_host_caching_: true,
+        }
+    }
 }
 
 impl DeviceVariableBuilder {
@@ -106,7 +117,7 @@ impl DeviceVariableBuilder {
         let buffer = unsafe {
             cctx.dev
                 .create_buffer(&buffer_create_info, None)
-                .map_err(|_| DeviceVariableError::BufferCreation)?
+                .map_err(|e| DeviceVariableError::BufferCreation(e))?
         };
 
         let buffer_memory_requirements = unsafe { cctx.dev.get_buffer_memory_requirements(buffer) };
@@ -174,12 +185,6 @@ pub struct KernelArgInfo {
     pub size: u64,
 }
 
-pub trait DeviceTransferable {
-    fn cpy_from(&mut self, memory: *const core::ffi::c_void, offset: usize);
-    fn cpy_to(&self, memory: *mut core::ffi::c_void, offset: usize);
-    fn size(&self) -> usize;
-}
-
 impl<'a> Kernel<'a> {
     pub fn new(
         cctx: &'a ComputeContext,
@@ -241,3 +246,32 @@ impl<'a> Drop for Kernel<'a> {
         }
     }
 }
+
+pub trait DeviceTransferable {
+    fn cpy_from(&mut self, memory: *const core::ffi::c_void, offset: usize);
+    fn cpy_to(&self, memory: *mut core::ffi::c_void, offset: usize);
+    fn size(&self) -> usize;
+}
+
+
+impl<T: Copy> DeviceTransferable for Vec<T> {
+    fn cpy_to(&self, ptr: *mut std::ffi::c_void, offset: usize) {
+        let mem_typed = unsafe {
+            std::slice::from_raw_parts_mut::<T>(ptr.add(offset).cast(), self.len() as usize)
+        };
+        mem_typed.copy_from_slice(self);
+    }
+
+    fn cpy_from(&mut self, ptr: *const std::ffi::c_void, offset: usize) {
+        let mem_typed = unsafe {
+            std::slice::from_raw_parts::<T>(ptr.add(offset).cast(), self.len() as usize)
+        };
+        self.copy_from_slice(mem_typed);
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<T>() * self.len()
+    }
+}
+
+
