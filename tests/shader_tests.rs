@@ -50,7 +50,8 @@ fn test_sum_array_shader() {
         .build(&cctx)
         .expect("Constructing dev_sum failed");
 
-    let mut dispatcher = vctk::Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+    let sum_sizes = ker_args.iter().map(|arg| {arg.size}).sum();
+    let mut dispatcher = vctk::Dispatcher::new(&cctx, 3, &[sum_sizes, 1, 1]).expect("Dispatcher creation failed");
 
     let host_variables: [&dyn vctk::DeviceTransferable; 3] = [&len, &nats, &sum];
     let dev_variables = [dev_len, dev_nats, dev_sum];
@@ -88,7 +89,7 @@ fn test_printing_shader() {
 
     let ker = vctk::Kernel::new(&cctx, &shader, ker_args.clone()).expect("Kernel creation failed");
 
-    let mut dispatcher = vctk::Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+    let mut dispatcher = vctk::Dispatcher::new(&cctx, 3, &[1,1,1]).expect("Dispatcher creation failed");
 
     dispatcher
         .launch_async(&ker, &[], 0, [1, 1, 1])

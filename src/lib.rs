@@ -53,8 +53,8 @@ pub enum ComputeContextError {
     VulkanError(#[from] Error),
 }
 
-#[derive(Clone)]
 pub struct ComputeContext {
+    instance: Instance,
     dev: Device,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     comp_queue_fam_idx: u32,
@@ -82,6 +82,7 @@ impl ComputeContext {
             unsafe { vk_instance.get_physical_device_memory_properties(physical_device) };
         let descr_pool = create_descriptor_pool(&dev, Self::DESCRIPTOR_COUNT)?;
         Ok(ComputeContext {
+            instance: vk_instance,
             dev,
             mem_props,
             comp_queue_fam_idx,
@@ -229,7 +230,10 @@ impl ComputeContext {
 impl Drop for ComputeContext {
     fn drop(&mut self) {
         unsafe {
+            let _ = self.dev.device_wait_idle();
             self.dev.destroy_descriptor_pool(self.descr_pool, None);
+            self.dev.destroy_device(None);
+            self.instance.destroy_instance(None);
         }
     }
 }
@@ -456,20 +460,24 @@ mod tests {
         ];
         Kernel::new(&cctx, &shader, arg_infos.clone()).expect("Kernel creation failed");
 
+        let len_var_size = std::mem::size_of::<u32>() as u64;
         let len = DeviceVariable::builder()
             .host_to_dev_transf(true)
             .is_uniformly_read(true)
-            .size(std::mem::size_of::<u32>() as u64)
+            .size(len_var_size)
             .build(&cctx)
             .expect("build len device variable failed");
+        let float_array_var_size = (float_data.len() * std::mem::size_of::<f32>()) as u64;
         let float_array = DeviceVariable::builder()
             .host_to_dev_transf(true)
             .is_uniformly_read(false)
-            .size((float_data.len() * std::mem::size_of::<f32>()) as u64)
+            .size(float_array_var_size)
             .build(&cctx)
             .expect("building device variable failed");
 
-        let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+        let mut dispatcher =
+            Dispatcher::new(&cctx, 3, &[len_var_size + float_array_var_size, 1, 1])
+                .expect("Dispatcher creation failed");
         let variables = [len, float_array];
         dispatcher
             .upload_async(&variables, &[&uint_data, &float_data], 0)
@@ -510,22 +518,26 @@ mod tests {
         let kernel =
             Kernel::new(&cctx, &shader, arg_infos.clone()).expect("Kernel creation failed");
 
+        let len_var_size = std::mem::size_of::<u32>() as u64;
         let len = DeviceVariable::builder()
             .host_to_dev_transf(true)
             .dev_to_host_transf(true)
             .is_uniformly_read(true)
-            .size(std::mem::size_of::<u32>() as u64)
+            .size(len_var_size)
             .build(&cctx)
             .expect("build len device variable failed");
+        let float_array_var_size = (float_data.len() * std::mem::size_of::<f32>()) as u64;
         let float_array = DeviceVariable::builder()
             .host_to_dev_transf(true)
             .dev_to_host_transf(true)
             .is_uniformly_read(false)
-            .size((float_data.len() * std::mem::size_of::<f32>()) as u64)
+            .size(float_array_var_size)
             .build(&cctx)
             .expect("building device variable failed");
 
-        let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+        let mut dispatcher =
+            Dispatcher::new(&cctx, 3, &[len_var_size + float_array_var_size, 1, 1])
+                .expect("Dispatcher creation failed");
         let variables = [len, float_array];
         let host_variables: &[&dyn DeviceTransferable] = &[&uint_data, &float_data];
 
@@ -593,7 +605,9 @@ mod tests {
 
         let dev_vars = [len, float_array];
         let host_vars: [&dyn DeviceTransferable; 2] = [&uint_data, &float_data];
-        let mut dispatcher = Dispatcher::new(&cctx, 3).expect("Dispatcher creation failed");
+        let mut dispatcher =
+            Dispatcher::new(&cctx, 3, &[arg_infos[0].size + arg_infos[1].size, 1, 1])
+                .expect("Dispatcher creation failed");
 
         dispatcher
             .upload_async(&dev_vars, &host_vars, 0)
