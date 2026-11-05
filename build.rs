@@ -14,6 +14,7 @@ fn main() {
     glsl_compile("src/shader/add_one.glsl", "data/shader/add_one.spv");
     glsl_compile("src/shader/sum_array.glsl", "data/shader/sum_array.spv");
     glsl_compile("src/shader/printing_shader.glsl", "data/shader/printing_shader.spv");
+    glsl_compile("src/shader/sum.glsl", "data/shader/sum.spv");
 }
 
 fn glsl_compile(input_path: &str, output_path: &str) {

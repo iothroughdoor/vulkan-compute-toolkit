@@ -12,3 +12,7 @@ serial_test = {version = "3.*"}
 [[test]]
 name = "shader_tests"
 path = "tests/shader_tests.rs"
+
+[[bin]]
+name = "bench_summation"
+path = "benchmarks/bench_summation.rs"
