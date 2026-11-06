@@ -6,6 +6,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
+gungraun = { version = "0.20.0", default-features = false, features = ["perf"] }
 cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git" }
 cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git" }
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git" }

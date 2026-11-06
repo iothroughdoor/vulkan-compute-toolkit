@@ -1,0 +1,40 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gungraun = { version = "0.20.0", features = ["perf"] }
+include-bytes-plus = {version = "*"}
+vulkan-computing-toolkit = {path = "../vulkan_computing_toolkit"}
+
+[[bench]]
+name = "bench_summation_vulkan_callgrind"
+harness = false
+path = "benches/bench_summation_vulkan_callgrind.rs"
+
+[[bench]]
+name = "bench_summation_oxide_callgrind"
+harness = false
+path = "benches/bench_summation_oxide_callgrind.rs"
+
+[[bench]]
+name = "bench_summation_vulkan_perf"
+harness = false
+path = "benches/bench_summation_vulkan_perf.rs"
+
+[[bench]]
+name = "bench_summation_oxide_perf"
+harness = false
+path = "benches/bench_summation_oxide_perf.rs"
+
+[[bench]]
+name = "bench_summation_vulkan_instant"
+harness = false
+path = "benches/bench_summation_vulkan_instant.rs"
+
+[[bench]]
+name = "bench_summation_oxide_instant"
+harness = false
+path = "benches/bench_summation_oxide_instant.rs"

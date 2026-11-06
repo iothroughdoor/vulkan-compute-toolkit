@@ -42,7 +42,6 @@ pub struct DeviceVariableBuilder {
     host_to_dev_transf_: bool,
     dev_to_host_transf_: bool,
     is_uniformly_readonly_: bool,
-    use_host_caching_: bool,
 }
 
 impl Default for DeviceVariableBuilder {
@@ -52,7 +51,6 @@ impl Default for DeviceVariableBuilder {
             host_to_dev_transf_: true,
             dev_to_host_transf_: true,
             is_uniformly_readonly_: false,
-            use_host_caching_: true,
         }
     }
 }
@@ -78,11 +76,6 @@ impl DeviceVariableBuilder {
         self
     }
 
-    pub fn use_host_caching(mut self, x: bool) -> DeviceVariableBuilder {
-        self.use_host_caching_ = x;
-        self
-    }
-
     pub fn build<'a>(
         self,
         cctx: &'a ComputeContext,
@@ -102,13 +95,7 @@ impl DeviceVariableBuilder {
             buffer_usage |= vk::BufferUsageFlags::STORAGE_BUFFER;
         }
 
-        let mut memory_properties = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        if self.use_host_caching_ {
-            // only necessary for host - device transfers
-            // stuff is cached on host side,
-            // speeds up transfer
-            memory_properties |= vk::MemoryPropertyFlags::HOST_CACHED;
-        }
+        let memory_properties = vk::MemoryPropertyFlags::DEVICE_LOCAL;
 
         let buffer_create_info = vk::BufferCreateInfo::default()
             .usage(buffer_usage)

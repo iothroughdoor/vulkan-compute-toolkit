@@ -257,9 +257,9 @@ fn create_vk_instance(app_name: &CStr, app_version: u32) -> Result<Instance, Err
         .api_version(vk::make_api_version(API_MAJOR, API_MINOR, API_PATCH, 0));
 
     let create_info = vk::InstanceCreateInfo::default()
-        .application_info(&app_info)
-        .enabled_layer_names(&layer_names)
-        .push_next(&mut validation_features);
+        .application_info(&app_info);
+        //.enabled_layer_names(&layer_names)
+        //.push_next(&mut validation_features);
 
     let entry = Entry::linked();
     unsafe {
@@ -329,7 +329,8 @@ fn find_memory_type_index(
         if buffer_required_memory_type & (1 << i) != 0
             && device_memory_properties.memory_types[i as usize]
                 .property_flags
-                .intersects(*requested_memory_properties)
+                //.intersects(*requested_memory_properties)
+                .contains(*requested_memory_properties)
         {
             return Some(i);
         }
@@ -412,7 +413,7 @@ mod tests {
     #[serial]
     fn smoke_kernel_creation_valid_shader() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let shader_bytes = std::fs::read("../data/shader/add_one.spv").expect("could not load shader");
         let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
             spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
@@ -438,7 +439,7 @@ mod tests {
     #[serial]
     fn smoke_submit_upload() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let shader_bytes = std::fs::read("../data/shader/add_one.spv").expect("could not load shader");
         let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
             spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
@@ -492,7 +493,7 @@ mod tests {
     #[serial]
     fn smoke_full_loop() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let shader_bytes = std::fs::read("../data/shader/add_one.spv").expect("could not load shader");
         let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
             spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
@@ -564,7 +565,7 @@ mod tests {
     #[serial]
     fn two_kernels() {
         let cctx = ComputeContext::new("App", 0).expect("Compute context creation failed");
-        let shader_bytes = std::fs::read("data/shader/add_one.spv").expect("could not load shader");
+        let shader_bytes = std::fs::read("../data/shader/add_one.spv").expect("could not load shader");
         let mut spirv = Vec::<u32>::new();
         for bytes in shader_bytes.chunks_exact(4) {
             spirv.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
